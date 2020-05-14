@@ -1,5 +1,5 @@
 """
-I arranged it from ohmeow/blurr(https://github.com/ohmeow/blurr/blob/67359a8f358b9f044ed561401a720ae5715c63cf/blurr/data.py), because it requires py>=3.7 but Colab has py=3.6 and I have simplified it to just for my needs. 
+I arranged it from ohmeow/blurr(https://github.com/ohmeow/blurr/blob/67359a8f358b9f044ed561401a720ae5715c63cf/blurr/data.py), because it requires py>=3.7 but Colab has py=3.6 and I simplified and twist it to just for my needs. 
 
 Anyway, checkout ohmeow's fantatistic work !
 """
@@ -34,20 +34,36 @@ class HF_TextBlock(TransformBlock):
         tokenizer_cls = partial(HF_Tokenizer, hf_tokenizer=hf_tokenizer)
         if (vocab is None): vocab = list(hf_tokenizer.get_vocab())
 
+        rules = kwargs.pop('rules', [] )
         tok_tfm = Tokenizer.from_df(text_cols,
                                     res_col_name=res_col_name,
                                     tok_func=tokenizer_cls,
-                                    rules=[], **kwargs)
+                                    rules=rules, **kwargs)
 
         return cls(tok_tfm, hf_tokenizer=hf_tokenizer, task=task,
                    hf_batch_tfm=hf_batch_tfm, vocab=vocab, max_seq_len=max_seq_len)
 
 # To just take hidden features output
 class HFModelWrapper(nn.Module):
-  def __init__(self,model, pad_id):
+  def __init__(self,model, pad_id, sep_id=None):
+    "pass sep token id if sentence A sentence B setting. (default is sentence A setting)"
     super().__init__()
     self.model = model
-    self.pad_id = pad_id
+    self.pad_id, self.sep_id = pad_id, sep_id
   def forward(self, x):
     attn_mask = x!= self.pad_id
-    return self.model(x, attn_mask)[0]
+    if self.sep_id is None:
+      return self.model(x, attn_mask)[0]
+    else:
+      return self.model(x, attn_mask, token_type_ids=self._token_type_ids_for(x))
+
+  def _token_type_ids_for(self, x):
+    "x: (batch size, sequence length)"
+    tok_type_ids = torch.zeros(x.shape, dtype=torch.long, device=x.device)
+    second_sent_head_pos = [ s.tolist().index(self.sep_id)+1 for s in x]
+    # [[CLS, I, am, hero, SEP, Yes, I, am, SEP],...] -> [5,..]
+    tok_type_ids[[torch.arange(x.shape[0]),second_sent_head_pos]] = 1
+    # tok_type_ids == [[0,0,..,0,1,0,0,..,0], ...]
+    return tok_type_ids.cumsum(dim=1)
+    # tok_type_ids.cumsum(dim=1) == [[0,0,..,0,1,1,..,1], ...]
+    
