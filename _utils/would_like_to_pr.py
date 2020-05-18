@@ -12,8 +12,9 @@ class TextDataloader(TfmdDL):
     device, dtype = first_text_tensor.device, first_text_tensor.dtype
     self.bos = torch.tensor([bos_idx_add] if bos_idx_add is not None else [], device=device, dtype=dtype)
     self.eos = torch.tensor([eos_idx_add] if eos_idx_add is not None else [], device=device, dtype=dtype)
+    self.add_bos_or_eos = bos_idx_add or eos_idx_add
 
-    store_attr(self,'dataset,max_seq_len,sort_by_len,agg_mode,ignore_gt_maxlen,remove_heads,remove_tails')
+    store_attr(self,'dataset,max_seq_len,sort_by_len,agg_mode,ignore_gt_maxlen,remove_heads,remove_tails,bos_idx_add,eos_idx_add')
     
     self.samples = L()
     # residual_len will reset to initial_residual_len
@@ -39,6 +40,10 @@ class TextDataloader(TfmdDL):
       if agg_mode is None: self.samples.append( (line_len, i) )
       elif agg_mode == 'lines': self._accumulate_lines(i, line_len)
       else: self._accumulate_window(i, line_len)
+    
+    if agg_mode is not None and self.new_sample:
+      if agg_mode == 'lines': self.samples.append((self.max_seq_len-self.residual_len, self.new_sample))
+      else: self.samples.append(self.new_sample)
 
     # specify total number of samples
     self.n = len(self.samples)
@@ -71,21 +76,22 @@ class TextDataloader(TfmdDL):
       "samples = [ (length, idx), ... ]"
       idx = self.samples[s][1]
       sample = self.dataset[idx]
-      text= TensorText(torch.cat([self.bos, sample[0][self.start:self.end], self.eos]))
-      return ( text, *sample[1:] )
+      line = sample[0][self.start:self.end]
+      text = torch.cat([self.bos, line, self.eos]) if self.add_bos_or_eos else line
+      return ( TensorText(text), *sample[1:] )
     elif self.agg_mode == 'lines':
       "samples = [ (length, [idx, idx, ...]) , ... ]"
-      agg_text = concat(*[ self.dataset[idx][0][self.start:self.end] for idx in self.samples[s][1] ] )
-      agg_text = TensorText(torch.cat([self.bos, agg_text, self.eos]))
-      return (agg_text, )
+      agg = [ self.dataset[idx][0][self.start:self.end] for idx in self.samples[s][1] ]
+      agg_text = concat(self.bos, *agg, self.eos) if self.add_bos_or_eos else concat(*agg)
+      return (TensorText(agg_text), )
     else: # window or lm
       "samples = [ (idx,start,end) ]"
-      agg_text = concat(*[ self.dataset[idx][0][start:end] for idx,start,end in self.samples[s] ])
-      agg_text = TensorText(torch.cat([self.bos, agg_text, self.eos]))
+      agg = [ self.dataset[idx][0][start:end] for idx,start,end in self.samples[s] ]
+      agg_text = concat(self.bos, *agg, self.eos) if self.add_bos_or_eos else concat(*agg)
       if self.agg_mode == 'window':
-        return (agg_text, )
+        return (TensorText(agg_text), )
       else: # 'lm'
-        return (LMTensorText(agg_text[:-1]), agg_text[1:])
+        return (LMTensorText(agg_text[:-1]), TensorText(agg_text[1:]))
 
   def shuffle_fn(self, idxs):
     if self.agg_mode in ['lm', 'window']:
@@ -94,36 +100,27 @@ class TextDataloader(TfmdDL):
       self.samples.sort(key=lambda s: s[0])
     return idxs
 
+  def cache(self, file_path):
+    tmp = self.dataset
+    self.dataset = None
+    torch.save(self, file_path)
+    self.dataset = tmp
+
+  @classmethod
+  def from_cache(cls, file_path, dataset):
+    dl = torch.load(file_path)
+    dl.dataset = dataset
+    return dl
+
   @delegates(TfmdDL.new)
   def new(self, dataset=None, **kwargs):
-    # assume val data should use the same max_seq_len with train data, single_line
-    'dataset,max_seq_len,sort_by_len,agg_mode,concat,ignore_gt_maxlen'
-    return TextDataloader(dataset=dataset,
-                          # if lm, pass max_seq_len after restore to original value
-                          max_seq_len=self.max_seq_len,
-                          sort_by_len=False, # valid set even don't shuffle
-                          agg_mode=self.agg_mode,
-                          ignore_gt_maxlen=False, # You can't discard data from valid set, especially test set
-                          **kwargs,
-    )
-
-"""Filteredbase.dataloaders didn't merge kwargs When creating validation dataloader, 
-which makes validation dataloader don't have pad_input_chunk as before_batch transform,
-that specified in Textblock.__init__"""
-def mydataloaders(self, bs=64, val_bs=None, shuffle_train=True, n=None, path='.', dl_type=None, dl_kwargs=None,
-                    device=None, **kwargs):
-  if device is None: device=default_device()
-  if dl_kwargs is None: dl_kwargs = [{}] * self.n_subsets
-  if dl_type is None: dl_type = self._dl_type
-  drop_last = kwargs.pop('drop_last', shuffle_train)
-  dl = dl_type(self.subset(0), bs=bs, shuffle=shuffle_train, drop_last=drop_last, n=n, device=device,
-               **merge(kwargs, dl_kwargs[0]))
-  dls = [dl] + [dl.new(self.subset(i), bs=(bs if val_bs is None else val_bs), shuffle=False, drop_last=False,
-                       n=None, **merge(kwargs, dl_kwargs[i])) for i in range(1, self.n_subsets)]
-  return self._dbunch_type(*dls, path=path, device=device)
-
-class MyDataBlock(DataBlock):
-  def dataloaders(self, source, path='.', verbose=False, **kwargs):
-    dsets = self.datasets(source)
-    kwargs = {**self.dls_kwargs, **kwargs, 'verbose': verbose}
-    return mydataloaders(dsets, path=path, after_item=self.item_tfms, after_batch=self.batch_tfms, **kwargs)
+    return super().new(dataset=dataset,
+                       max_seq_len=self.max_seq_len,
+                       sort_by_len=self.sort_by_len,
+                       agg_mode=self.agg_mode,
+                       ignore_gt_maxlen=False, # You can't discard data from valid set, especially test set
+                       remove_heads=self.remove_heads,
+                       remove_tails=self.remove_tails,
+                       bos_idx_add=self.bos_idx_add,
+                       eos_idx_add=self.eos_idx_add,
+                       **kwargs,)
