@@ -106,32 +106,38 @@ class TextDataloader(TfmdDL):
     return idxs
 
   def cache(self, file_path):
-    tmp = self.dataset
-    self.dataset = None
     torch.save(self, file_path)
-    self.dataset = tmp
+
+  def __getstate__(self):
+    "specify something you don't want pickle here, remember to use copy to not modfiy orginal instance"
+    state = self.__dict__.copy()
+    state['dataset'] = None
+    return state
 
   #@delegates(TextDataloader.__init__) but we haven't evaluated TextDataloader
   @delegates(TfmdDL.new)
   @classmethod
   def from_cache(cls, file_path, dataset, **kwargs):
-    """
-    1. You must pass the dataset as the same as the original one.
-    2. You can not change args for TextDataloader itself (e.g. change bos_idx_add).
-    3. But you can change args for TfmDL (e.g. change bs), which results in reinit of TfmDL,
-       So you need to pass all other arguments (e.g. before_batch=...) like what you did in first time.
-    """
     dl = torch.load(file_path)
     dl.dataset = dataset
-    if kwargs:
-      # reject change that cause arguments be inconsistent with loaded `self.samples` record 
-      for arg in ['max_seq_len','agg_mode','ignore_gt_maxlen','remove_heads','remove_tails']:
-        assert arg not in kwargs, f"Specifying {arg} will make it inconsistent with cached internal record."
-      for arg in ['bos_idx_add','eos_idx_add']:
-        if arg in kwargs: assert (kwargs[arg] is None) == (getattr(dl, arg) is None), f"You can't change whether to add head/eos from cached setting."
-      return dl.new(dataset, samples=dl.samples, **kwargs)
-    else:
-      return dl
+
+    # Even if spefify no kwargs and just load original dataloader, using 
+    # new method can update device and dtype of bos and eos for this dataset
+    # reject change that cause arguments be inconsistent with loaded `self.samples` record 
+    for arg in ['max_seq_len','agg_mode','ignore_gt_maxlen','remove_heads','remove_tails']:
+      assert arg not in kwargs, f"Specifying {arg} will make it inconsistent with cached internal record."
+    for arg in ['bos_idx_add','eos_idx_add']:
+      if arg in kwargs: assert (kwargs[arg] is None) == (getattr(dl, arg) is None), f"You can't change whether to add head/eos from cached setting."
+    dl = dl.new(dataset, samples=dl.samples, **kwargs)
+    # Consider whether setting up newly pased batch tfms, cuz new method just make do_setup=false
+    # Actually I don't know if it is good, but at leaat it works for pad_input_chunk as before_batch
+    if kwargs.pop('do_setup', True):
+      for nm in ['after_item','before_batch','after_batch']:
+        if nm in kwargs:
+          kwargs[nm] = Pipeline(kwargs.get(nm,None)) # don't know why Pipeline creating in TfmdDL won't be done in this case, but we can do it here and even it has done, it is ok we just Pipeline it again. 
+          pv(f"Setting up {nm}: {kwargs[nm]}", kwargs.pop('verbose', False))
+          kwargs[nm].setup(dl)
+    return dl
 
   @delegates(TfmdDL.new)
   def new(self, dataset=None, **kwargs):
