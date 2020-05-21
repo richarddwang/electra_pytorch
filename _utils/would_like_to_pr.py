@@ -1,11 +1,12 @@
+from tqdm import tqdm
 from fastai2.text.all import *
 
 @delegates()
 class TextDataloader(TfmdDL):
-  def __init__(self, dataset, max_seq_len=float('inf'), sort_by_len=True, agg_mode=None, ignore_gt_maxlen=True, remove_heads=False, remove_tails=False, bos_idx_add=None, eos_idx_add=None, **kwargs):
+  def __init__(self, dataset, max_seq_len=float('inf'), sort_by_len=True, agg_mode=None, ignore_gt_maxlen=True, remove_heads=False, remove_tails=False, bos_idx_add=None, eos_idx_add=None, show_bar=True, samples=None, **kwargs):
     super().__init__(dataset, **kwargs)
     assert agg_mode in [None, 'lm', 'lines', 'window']
-    assert not (agg_mode and max_seq_len is None) 
+    assert not (agg_mode and max_seq_len is None)
     self.sort_by_len = sort_by_len and agg_mode in [None, 'lines'] # sorting makes sense only with these modes
     ignore_gt_maxlen = ignore_gt_maxlen and agg_mode in [None, 'lines'] and max_seq_len is not None
     first_text_tensor = dataset[0][0]
@@ -13,9 +14,16 @@ class TextDataloader(TfmdDL):
     self.bos = torch.tensor([bos_idx_add] if bos_idx_add is not None else [], device=device, dtype=dtype)
     self.eos = torch.tensor([eos_idx_add] if eos_idx_add is not None else [], device=device, dtype=dtype)
     self.add_bos_or_eos = bos_idx_add or eos_idx_add
+    # only use [start:end] text to concatenate (if needed)
+    self.start = 0 if not remove_heads else 1
+    self.end = None if not remove_tails else -1
 
-    store_attr(self,'dataset,max_seq_len,sort_by_len,agg_mode,ignore_gt_maxlen,remove_heads,remove_tails,bos_idx_add,eos_idx_add')
+    store_attr(self,'dataset,max_seq_len,sort_by_len,agg_mode,ignore_gt_maxlen,remove_heads,remove_tails,bos_idx_add,eos_idx_add,show_bar')
     
+    if samples is not None: # Load from cache
+      self.samples, self.n = samples, len(samples)
+      return
+
     self.samples = L()
     # residual_len will reset to initial_residual_len
     # lm mode: max_seq_len text and 1 right-shift text, so take max_seq_len + 1 window
@@ -24,11 +32,8 @@ class TextDataloader(TfmdDL):
     if bos_idx_add is not None: self.initial_residual_len -= 1
     if eos_idx_add is not None: self.initial_residual_len -= 1
     self.residual_len, self.new_sample = self.initial_residual_len, []
-    # only use [start:end] text to concatenate (if needed)
-    self.start = 0 if not remove_heads else 1
-    self.end = None if not remove_tails else -1
 
-    for i, sample in enumerate(dataset):
+    for i, sample in tqdm(enumerate(dataset), desc='TextDataloader init:', total=len(dataset), disable=not show_bar):
       line_len = len(sample[0])
       if remove_heads: line_len -= 1
       if remove_tails: line_len -= 1
@@ -106,21 +111,35 @@ class TextDataloader(TfmdDL):
     torch.save(self, file_path)
     self.dataset = tmp
 
+  #@delegates(TextDataloader.__init__) but we haven't evaluated TextDataloader
+  @delegates(TfmdDL.new)
   @classmethod
-  def from_cache(cls, file_path, dataset):
+  def from_cache(cls, file_path, dataset, **kwargs):
+    """
+    1. You must pass the dataset as the same as the original one.
+    2. You can not change args for TextDataloader itself (e.g. change bos_idx_add).
+    3. But you can change args for TfmDL (e.g. change bs), which results in reinit of TfmDL,
+       So you need to pass all other arguments (e.g. before_batch=...) like what you did in first time.
+    """
     dl = torch.load(file_path)
     dl.dataset = dataset
-    return dl
+    if kwargs:
+      # reject change that cause arguments be inconsistent with loaded `self.samples` record 
+      for arg in ['max_seq_len','agg_mode','ignore_gt_maxlen','remove_heads','remove_tails']:
+        assert arg not in kwargs, f"Specifying {arg} will make it inconsistent with cached internal record."
+      for arg in ['bos_idx_add','eos_idx_add']:
+        if arg in kwargs: assert (kwargs[arg] is None) == (getattr(dl, arg) is None), f"You can't change whether to add head/eos from cached setting."
+      return dl.new(dataset, samples=dl.samples, **kwargs)
+    else:
+      return dl
 
   @delegates(TfmdDL.new)
   def new(self, dataset=None, **kwargs):
+    cur_args = dict(max_seq_len=self.max_seq_len, sort_by_len=self.sort_by_len,agg_mode=self.agg_mode,ignore_gt_maxlen=self.ignore_gt_maxlen,remove_heads=self.remove_heads, remove_tails=self.remove_tails, bos_idx_add=self.bos_idx_add, eos_idx_add=self.eos_idx_add,show_bar=self.show_bar)
+    
+    # To create valid dl, only train_dl.new(shuffle=True/not specified) can skip this 
+    if not self.shuffle or not getattr(kwargs, 'shuffle', True): # (is valid dl) or (told to create valid dl) -> to create valid dl
+      cur_args['ignore_gt_maxlen'] = False # You can't discard data from dataset for validation, especially test set
+    
     return super().new(dataset=dataset,
-                       max_seq_len=self.max_seq_len,
-                       sort_by_len=self.sort_by_len,
-                       agg_mode=self.agg_mode,
-                       ignore_gt_maxlen=False, # You can't discard data from valid set, especially test set
-                       remove_heads=self.remove_heads,
-                       remove_tails=self.remove_tails,
-                       bos_idx_add=self.bos_idx_add,
-                       eos_idx_add=self.eos_idx_add,
-                       **kwargs,)
+                       **merge(cur_args, kwargs)) # kwargs overwrite cur_args
