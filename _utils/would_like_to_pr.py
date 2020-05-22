@@ -105,7 +105,7 @@ class TextDataloader(TfmdDL):
         return (LMTensorText(agg_text[:-1]), TensorText(agg_text[1:]))
 
   def shuffle_fn(self, idxs):
-    if self.agg_mode in ['lm', 'window']:
+    if not self.sort_by_len: # notice sort_by_len in lm and winodw mode will be False
       self.samples.shuffle()
     return idxs
 
