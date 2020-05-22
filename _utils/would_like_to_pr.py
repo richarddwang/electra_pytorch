@@ -3,11 +3,12 @@ from fastai2.text.all import *
 
 @delegates()
 class TextDataloader(TfmdDL):
-  def __init__(self, dataset, max_seq_len=float('inf'), sort_by_len=True, agg_mode=None, ignore_gt_maxlen=True, remove_heads=False, remove_tails=False, bos_idx_add=None, eos_idx_add=None, show_bar=True, samples=None, **kwargs):
+  def __init__(self, dataset, max_seq_len=float('inf'), sort_by_len='desc', agg_mode=None, ignore_gt_maxlen=True, remove_heads=False, remove_tails=False, bos_idx_add=None, eos_idx_add=None, show_bar=True, samples=None, **kwargs):
     super().__init__(dataset, **kwargs)
     assert agg_mode in [None, 'lm', 'lines', 'window']
     assert not (agg_mode and max_seq_len is None)
-    self.sort_by_len = sort_by_len and agg_mode in [None, 'lines'] # sorting makes sense only with these modes
+    assert sort_by_len in [False, 'desc', 'asc']
+    if agg_mode in ['window','lm']: sort_by_len=False # sorting makes no sense with these modes
     ignore_gt_maxlen = ignore_gt_maxlen and agg_mode in [None, 'lines'] and max_seq_len is not None
     first_text_tensor = dataset[0][0]
     device, dtype = first_text_tensor.device, first_text_tensor.dtype
@@ -21,7 +22,9 @@ class TextDataloader(TfmdDL):
     store_attr(self,'dataset,max_seq_len,sort_by_len,agg_mode,ignore_gt_maxlen,remove_heads,remove_tails,bos_idx_add,eos_idx_add,show_bar')
     
     if samples is not None: # Load from cache
-      self.samples, self.n = samples, len(samples)
+      if sort_by_len: self.samples = sorted(samples, key=lambda s: s[0], reverse=True if sort_by_len=='desc' else False)
+      else: self.samples = samples
+      self.n = len(samples)
       return
 
     self.samples = L()
@@ -50,6 +53,9 @@ class TextDataloader(TfmdDL):
       if agg_mode == 'lines': self.samples.append((self.max_seq_len-self.residual_len, self.new_sample))
       else: self.samples.append(self.new_sample)
 
+    # sort if needed
+    if sort_by_len:
+      self.samples.sort(key=lambda s: s[0], reverse=True if sort_by_len=='desc' else False)
     # specify total number of samples
     self.n = len(self.samples)
       
@@ -101,9 +107,17 @@ class TextDataloader(TfmdDL):
   def shuffle_fn(self, idxs):
     if self.agg_mode in ['lm', 'window']:
       self.samples.shuffle()
-    else:
-      self.samples.sort(key=lambda s: s[0])
     return idxs
+
+  def desc_sort(self):
+    assert self.agg_mode not in ['window','lm'], f"Sorting by length makes no sense on aggregation mode {self.agg_mode}"
+    self.samples.sort(key=lambda s: s[0], reverse=True)
+    self.sort_by_len = 'desc'
+
+  def asc_sort(self):
+    assert self.agg_mode not in ['window','lm'], f"Sorting by length makes no sense on aggregation mode {self.agg_mode}"
+    self.samples.sort(key=lambda s: s[0], reverse=False)
+    self.sort_by_len = 'asc'
 
   def cache(self, file_path):
     torch.save(self, file_path)
@@ -121,13 +135,16 @@ class TextDataloader(TfmdDL):
     dl = torch.load(file_path)
     dl.dataset = dataset
 
-    # Even if spefify no kwargs and just load original dataloader, using 
-    # new method can update device and dtype of bos and eos for this dataset
-    # reject change that cause arguments be inconsistent with loaded `self.samples` record 
+    # Reject change that cause arguments be inconsistent with loaded `self.samples` record 
     for arg in ['max_seq_len','agg_mode','ignore_gt_maxlen','remove_heads','remove_tails']:
       assert arg not in kwargs, f"Specifying {arg} will make it inconsistent with cached internal record."
+    if 'sort_by_len' in kwargs:
+      assert not (dl.sort_by_len and not kwargs['sort_by_len']), f"Cached textdl is internal sorted, it can't restore orignal order."
     for arg in ['bos_idx_add','eos_idx_add']:
       if arg in kwargs: assert (kwargs[arg] is None) == (getattr(dl, arg) is None), f"You can't change whether to add head/eos from cached setting."
+    # TextDataloader.new guess creating validation dataloader if don't drop_last, but it might not be the case
+    kwargs['ignore_gt_maxlen'] = dl.ignore_gt_maxlen
+    # Even if spefify no kwargs and just load original dataloader, using new method can update device and dtype of bos and eos for this dataset
     dl = dl.new(dataset, samples=dl.samples, **kwargs)
     # Consider whether setting up newly pased batch tfms, cuz new method just make do_setup=false
     # Actually I don't know if it is good, but at leaat it works for pad_input_chunk as before_batch
@@ -143,8 +160,8 @@ class TextDataloader(TfmdDL):
   def new(self, dataset=None, **kwargs):
     cur_args = dict(max_seq_len=self.max_seq_len, sort_by_len=self.sort_by_len,agg_mode=self.agg_mode,ignore_gt_maxlen=self.ignore_gt_maxlen,remove_heads=self.remove_heads, remove_tails=self.remove_tails, bos_idx_add=self.bos_idx_add, eos_idx_add=self.eos_idx_add,show_bar=self.show_bar)
     
-    # To create valid dl, only train_dl.new(shuffle=True/not specified) can skip this 
-    if not self.shuffle or not getattr(kwargs, 'shuffle', True): # (is valid dl) or (told to create valid dl) -> to create valid dl
+    # we assume if you don't drop_last, you are going to create validation dl, specify ignore_gt_maxlen in kwargs to overwrite it if this is not in the case  
+    if not getattr(kwargs, 'drop_last', self.drop_last): 
       cur_args['ignore_gt_maxlen'] = False # You can't discard data from dataset for validation, especially test set
     
     return super().new(dataset=dataset,
