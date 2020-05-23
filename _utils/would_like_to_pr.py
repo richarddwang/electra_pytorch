@@ -3,7 +3,7 @@ from fastai2.text.all import *
 
 @delegates()
 class TextDataloader(TfmdDL):
-  def __init__(self, dataset, max_seq_len=float('inf'), sort_by_len='desc', agg_mode=None, ignore_gt_maxlen=True, remove_heads=False, remove_tails=False, bos_idx_add=None, eos_idx_add=None, show_bar=True, samples=None, **kwargs):
+  def __init__(self, dataset, max_seq_len=float('inf'), sort_by_len='desc', agg_mode=None, ignore_gt_maxlen=True, remove_heads=False, remove_tails=False, bos_idx_add=None, eos_idx_add=None, show_bar=None, samples=None, **kwargs):
     super().__init__(dataset, **kwargs)
     assert agg_mode in [None, 'lm', 'lines', 'window']
     assert not (agg_mode and max_seq_len is None)
@@ -18,6 +18,7 @@ class TextDataloader(TfmdDL):
     # only use [start:end] text to concatenate (if needed)
     self.start = 0 if not remove_heads else 1
     self.end = None if not remove_tails else -1
+    if show_bar is None: show_bar = len(dataset) > 200000
 
     store_attr(self,'dataset,max_seq_len,sort_by_len,agg_mode,ignore_gt_maxlen,remove_heads,remove_tails,bos_idx_add,eos_idx_add,show_bar')
     
