@@ -55,7 +55,7 @@ class HFModelWrapper(nn.Module):
     if self.sep_id is None:
       return self.model(x, attn_mask)[0]
     else:
-      return self.model(x, attn_mask, token_type_ids=self._token_type_ids_for(x))
+      return self.model(x, attn_mask, token_type_ids=self._token_type_ids_for(x))[0]
 
   def _token_type_ids_for(self, x):
     "x: (batch size, sequence length)"
