@@ -1,5 +1,6 @@
 from tqdm import tqdm
-from scipy import stats as scs
+import sklearn.metrics as skm
+import scipy.stats as scs
 from fastai2.text.all import *
 
 @delegates()
