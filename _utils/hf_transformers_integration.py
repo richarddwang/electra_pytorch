@@ -44,7 +44,7 @@ class HF_TextBlock(TransformBlock):
                    hf_batch_tfm=hf_batch_tfm, vocab=vocab, max_seq_len=max_seq_len)
 
 # To just take hidden features output
-class HFModelWrapper(nn.Module):
+class HF_ModelWrapper(nn.Module):
   def __init__(self,model, pad_id, sep_id=None):
     "pass sep token id if sentence A sentence B setting. (default is sentence A setting)"
     super().__init__()
@@ -59,6 +59,9 @@ class HFModelWrapper(nn.Module):
 
   def _token_type_ids_for(self, x):
     "x: (batch size, sequence length)"
+    num_sep = (x==self.sep_id).sum().item()
+    if num_sep == x.shape[0]: return None
+    assert num_sep == 2*x.shape[0], "Samples should all contains only one or all contains only two [SEP] in each of their texts"
     tok_type_ids = torch.zeros(x.shape, dtype=torch.long, device=x.device)
     second_sent_head_pos = [ s.tolist().index(self.sep_id)+1 for s in x]
     # [[CLS, I, am, hero, SEP, Yes, I, am, SEP],...] -> [5,..]
@@ -66,4 +69,3 @@ class HFModelWrapper(nn.Module):
     # tok_type_ids == [[0,0,..,0,1,0,0,..,0], ...]
     return tok_type_ids.cumsum(dim=1)
     # tok_type_ids.cumsum(dim=1) == [[0,0,..,0,1,1,..,1], ...]
-    
