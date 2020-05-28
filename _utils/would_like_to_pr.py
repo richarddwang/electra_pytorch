@@ -1,4 +1,5 @@
 from tqdm import tqdm
+from scipy import stats as scs
 from fastai2.text.all import *
 
 @delegates()
@@ -167,3 +168,43 @@ class TextDataloader(TfmdDL):
     
     return super().new(dataset=dataset,
                        **merge(cur_args, kwargs)) # kwargs overwrite cur_args
+
+"""
+There is bug in scikit_learn (https://github.com/scikit-learn/scikit-learn/issues/16924)
+so you always get `RuntimeWarning: invalid value encountered in double_scalar` and get a value 0.0
+"""
+def MatthewsCorrCoef(sample_weight=None, **kwargs):
+    return skm_to_fastai(skm.matthews_corrcoef, sample_weight=sample_weight, **kwargs)
+
+"""
+If you see PearsonRConstantInputWarning, that may mean the model always outputs a specific label,
+which is probable when you test something with very small dataset size or very short training
+"""
+@delegates(AccumMetric.__init__)
+def scs_to_fastai(func, dim_argmax=-1, **kwargs):
+  return AccumMetric(func, dim_argmax=-1, **kwargs)
+
+@delegates(scs_to_fastai)
+def PearsonCorrCoef(**kwargs):
+    "Pearson correlation coefficient"
+    def pearsonr(x,y): return scs.pearsonr(x,y)[0]
+    return scs_to_fastai(pearsonr, invert_arg=False, **kwargs)
+"""
+For the same reason as Pearson correlation, you may see nan for value of Spearman correlation, and
+RuntimeWarning: invalid value encountered in true_divide, because there is no mutual change. 
+(see https://stackoverflow.com/questions/45897003/python-numpy-corrcoef-runtimewarning-invalid-value-encountered-in-true-divide)
+"""
+# metric for STS task
+@delegates(scs_to_fastai)
+def SpearmanCorrCoef(axis=0, nan_policy='propagate', **kwargs):
+    "Spearman correlation coefficient"
+    def spearmanr(a,b=None,**kwargs): return scs.spearmanr(a,b,**kwargs)[0]
+    return scs_to_fastai(spearmanr, invert_arg=False, axis=axis, nan_policy=nan_policy, **kwargs)
+
+"""
+I would like more uniform way to pass the metrics, no matter loss_func or metric,
+instantiate it and then pass.
+This uniform way also make it possible such as `metrics=[m() for m inTASK_METRICS[task]]`
+"""
+def Accuracy(axis=-1):
+  return AvgMetric(partial(accuracy, axis=axis))
