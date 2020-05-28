@@ -209,3 +209,13 @@ This uniform way also make it possible such as `metrics=[m() for m inTASK_METRIC
 """
 def Accuracy(axis=-1):
   return AvgMetric(partial(accuracy, axis=axis))
+
+
+@log_args
+@delegates(keep=True)
+class LabelSmoothingCrossEntropyFlat(BaseLoss):
+    "Same as `nn.CrossEntropyLoss`, but flattens input and target."
+    y_int = True
+    def __init__(self, *args, axis=-1, **kwargs): super().__init__(LabelSmoothingCrossEntropy, *args, axis=axis, **kwargs)
+    def activation(self, out): return F.softmax(out, dim=-1)
+    def decodes(self, out):    return out.argmax(dim=-1)
