@@ -5,6 +5,7 @@ Anyway, checkout ohmeow's fantatistic work !
 """
 from functools import partial
 from torch import nn
+import nlp
 from fastai2.text.all import *
 
 class HF_Tokenizer():
