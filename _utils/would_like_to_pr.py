@@ -5,7 +5,7 @@ from fastai2.text.all import *
 
 @delegates()
 class TextDataloader(TfmdDL):
-  def __init__(self, dataset, max_seq_len=float('inf'), sort_by_len='desc', agg_mode=None, ignore_gt_maxlen=True, remove_heads=False, remove_tails=False, bos_idx_add=None, eos_idx_add=None, show_bar=None, samples=None, **kwargs):
+  def __init__(self, dataset, max_seq_len=float('inf'), sort_by_len='desc', agg_mode=None, ignore_gt_maxlen=True, remove_heads=False, remove_tails=False, bos_idx_add=None, eos_idx_add=None, samples=None, **kwargs):
     super().__init__(dataset, **kwargs)
     assert agg_mode in [None, 'lm', 'lines', 'window']
     assert not (agg_mode and max_seq_len is None)
@@ -20,9 +20,8 @@ class TextDataloader(TfmdDL):
     # only use [start:end] text to concatenate (if needed)
     self.start = 0 if not remove_heads else 1
     self.end = None if not remove_tails else -1
-    if show_bar is None: show_bar = len(dataset) > 200000
 
-    store_attr(self,'dataset,max_seq_len,sort_by_len,agg_mode,ignore_gt_maxlen,remove_heads,remove_tails,bos_idx_add,eos_idx_add,show_bar')
+    store_attr(self,'dataset,max_seq_len,sort_by_len,agg_mode,ignore_gt_maxlen,remove_heads,remove_tails,bos_idx_add,eos_idx_add')
     
     if samples is not None: # Load from cache
       if sort_by_len: self.samples = sorted(samples, key=lambda s: s[0], reverse=True if sort_by_len=='desc' else False)
@@ -39,7 +38,7 @@ class TextDataloader(TfmdDL):
     if eos_idx_add is not None: self.initial_residual_len -= 1
     self.residual_len, self.new_sample = self.initial_residual_len, []
 
-    for i, sample in tqdm(enumerate(dataset), desc='TextDataloader init:', total=len(dataset), disable=not show_bar):
+    for i, sample in tqdm(enumerate(dataset), desc='TextDataloader init:', total=len(dataset), leave=False):
       line_len = len(sample[0])
       if remove_heads: line_len -= 1
       if remove_tails: line_len -= 1
@@ -161,7 +160,7 @@ class TextDataloader(TfmdDL):
 
   @delegates(TfmdDL.new)
   def new(self, dataset=None, **kwargs):
-    cur_args = dict(max_seq_len=self.max_seq_len, sort_by_len=self.sort_by_len,agg_mode=self.agg_mode,ignore_gt_maxlen=self.ignore_gt_maxlen,remove_heads=self.remove_heads, remove_tails=self.remove_tails, bos_idx_add=self.bos_idx_add, eos_idx_add=self.eos_idx_add,show_bar=self.show_bar)
+    cur_args = dict(max_seq_len=self.max_seq_len, sort_by_len=self.sort_by_len,agg_mode=self.agg_mode,ignore_gt_maxlen=self.ignore_gt_maxlen,remove_heads=self.remove_heads, remove_tails=self.remove_tails, bos_idx_add=self.bos_idx_add, eos_idx_add=self.eos_idx_add)
     
     # we assume if you don't drop_last, you are going to create validation dl, specify ignore_gt_maxlen in kwargs to overwrite it if this is not in the case  
     if not getattr(kwargs, 'drop_last', self.drop_last): 

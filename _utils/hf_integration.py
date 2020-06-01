@@ -47,11 +47,17 @@ class HF_TextBlock(TransformBlock):
 
 # To just take hidden features output
 class HF_ModelWrapper(nn.Module):
-  def __init__(self,model, pad_id, sep_id=None):
+  
+  @classmethod
+  def from_pretrained(cls, hf_cls, cp_name, pad_id, sep_id=None):
+    return cls(model=hf_cls.from_pretrained(cp_name), pad_id=pad_id, sep_id=sep_id)
+  
+  def __init__(self, model, pad_id, sep_id=None):
     "pass sep token id if sentence A sentence B setting. (default is sentence A setting)"
     super().__init__()
     self.model = model
     self.pad_id, self.sep_id = pad_id, sep_id
+    
   def forward(self, x):
     attn_mask = x!= self.pad_id
     if self.sep_id is None:
