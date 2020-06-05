@@ -5,7 +5,7 @@ from fastai2.text.all import *
 
 @delegates()
 class TextDataloader(TfmdDL):
-  def __init__(self, dataset, max_seq_len=float('inf'), sort_by_len='desc', agg_mode=None, ignore_gt_maxlen=True, remove_heads=False, remove_tails=False, bos_idx_add=None, eos_idx_add=None, samples=None, **kwargs):
+  def __init__(self, dataset, max_seq_len=float('inf'), sort_by_len='desc', agg_mode=None, ignore_gt_maxlen=False, remove_heads=False, remove_tails=False, bos_idx_add=None, eos_idx_add=None, samples=None, **kwargs):
     super().__init__(dataset, **kwargs)
     assert agg_mode in [None, 'lm', 'lines', 'window']
     assert not (agg_mode and max_seq_len is None)

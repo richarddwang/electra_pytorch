@@ -141,3 +141,10 @@ class HF_Datasets(FilteredBase):
   def __getitem__(self, i): return self.datasets[i]
   @property
   def n_subsets(self): return len(self.datasets)
+
+def text_decode_fc(tokenizer, x, pretty=True):
+  if pretty:
+    return tokenizer.decode([idx for idx in x if idx != tokenizer.pad_token_id])
+  else:
+    tokens = tokenizer.convert_ids_to_tokens(x)
+    return ' '.join(tokens)
