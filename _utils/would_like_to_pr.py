@@ -182,13 +182,13 @@ which is probable when you test something with very small dataset size or very s
 """
 @delegates(AccumMetric.__init__)
 def scs_to_fastai(func, dim_argmax=-1, **kwargs):
-  return AccumMetric(func, dim_argmax=-1, **kwargs)
+  return AccumMetric(func, dim_argmax=dim_argmax, **kwargs)
 
 @delegates(scs_to_fastai)
 def PearsonCorrCoef(**kwargs):
-    "Pearson correlation coefficient"
+    "Pearson correlation coefficient for regression problem"
     def pearsonr(x,y): return scs.pearsonr(x,y)[0]
-    return scs_to_fastai(pearsonr, invert_arg=False, **kwargs)
+    return scs_to_fastai(pearsonr, invert_arg=False, dim_argmax=None, **kwargs)
 """
 For the same reason as Pearson correlation, you may see nan for value of Spearman correlation, and
 RuntimeWarning: invalid value encountered in true_divide, because there is no mutual change. 
@@ -197,9 +197,9 @@ RuntimeWarning: invalid value encountered in true_divide, because there is no mu
 # metric for STS task
 @delegates(scs_to_fastai)
 def SpearmanCorrCoef(axis=0, nan_policy='propagate', **kwargs):
-    "Spearman correlation coefficient"
+    "Spearman correlation coefficient for regression problem"
     def spearmanr(a,b=None,**kwargs): return scs.spearmanr(a,b,**kwargs)[0]
-    return scs_to_fastai(spearmanr, invert_arg=False, axis=axis, nan_policy=nan_policy, **kwargs)
+    return scs_to_fastai(spearmanr, invert_arg=False, dim_argmax=None, axis=axis, nan_policy=nan_policy, **kwargs)
 
 """
 I would like more uniform way to pass the metrics, no matter loss_func or metric,
