@@ -6,12 +6,22 @@ import nlp
 from fastai2.text.all import *
 
 class HF_TokenizeTfm():
-  
+  """
+  Args:
+    `hf_dset` (`nlp.Dataset`)
+    `cols`: with one of the following signature:
+      - `cols`(`List[str]`): tokenize the col into col
+      - `cols`(`Dict[str]`): tokenize the col(key) and into col(value)
+    `hf_tokenizer`: tokenizer of HuggingFace/Transformers.
+    `remove_original`: after tokenization, remove all original columns to save cache size.
+  """
   def __init__(self, hf_dset, cols, hf_tokenizer, remove_original=False):
     if isinstance(cols, list): cols = {c:c for c in cols}
     assert isinstance(cols, dict)
     self.hf_dset, self.cols, self.tokenizer = hf_dset, cols, hf_tokenizer
     self.remove_original = remove_original
+    if remove_original:
+      for in_col,out_col in cols.items(): assert in_col !=  out_col
     """
     If don't specify cache file name, it will be hashed binary of pickled function that
     passed to `map`, so if you pass the same function, it knows to use cache.
@@ -40,25 +50,57 @@ class HF_TokenizeTfm():
 
 @delegates()
 class HF_Dataloader(TfmdDL):
-  
-  def __init__(self, dataset, pad_idx, sort=True, **kwargs):
+  """
+  Args:
+    `dataset`: any class that output a tuple, which has token ids in its first element, from `__getitem__`.
+    `pad_idx` (`int`): If sepcified, pad texts to the longest text in the batch.
+    `sort` (`Optional[bool]`, default: `True`): Sort the samples with their length, thus samples of similar legnth collated into a batch and we can pad less. Notice if it is True, the shuffle will be overrided and not shuffle.
+    `filterout` (`Optional[callable(*args) -> bool]`, , default: `None`): if not `None`, judege whether exclude this sample with this sample(`tuple`) as args
+    `cache_file` (`Optional[str]`, default: `None`): A name of json file to store the computed record of results of sort or filterout.   
+  """
+  def __init__(self, dataset, pad_idx, sort=True, filterout=None, cache_file=None, **kwargs):
     if pad_idx is not None:
       kwargs['before_batch'] = partial(pad_input_chunk, pad_idx=pad_idx, pad_first=False)
-    if sort:
-      self.lens = [ len(sample[0]) for sample in dataset ]
-    store_attr(self, 'pad_idx,sort')
+
+    cache_file = Path(cache_file) if cache_file else None
+    if cache_file and cache_file.exists():
+      with cache_file.open(mode='r') as f: self.samples = json.load(f)
+    elif sort or filterout:
+      if cache_file: cache_file.touch()
+      try:
+        if filterout is None: filterout = lambda *args: False
+        self.samples = [ (i,len(sample[0])) for i, sample in tqdm(enumerate(dataset), leave=False) if not filterout(*sample) ]
+        if sort: self.samples.sort(key=lambda t:t[1], reverse=True)
+      except Exception as e:
+        os.remove(cache_file)
+        raise e
+      if cache_file:
+        with cache_file.open(mode='w') as f: json.dump(self.samples, f)
+    else:
+      self.samples = [ (i,None) for i in range(len(dataset))]
+
+    store_attr(self, 'pad_idx,sort,filterout,cache_file')
     super().__init__(dataset, **kwargs)
+    if sort: self.shuffle=False
+    self.n = len(self.samples)
   
-  def get_idxs(self):
-    idxs = super().get_idxs()
-    if not self.sort : return idxs
-    return sorted(idxs, key=lambda i: self.lens[i], reverse=True)
+  def create_item(self, i): return self.dataset[self.samples[i][0]]
 
   def new(self, dataset, **kwargs):
-    return super().new(dataset=self.dataset, pad_idx=self.pad_idx, sort=self.sort, **kwargs)
+    return super().new(dataset=dataset, pad_idx=self.pad_idx, sort=self.sort, filterout=self.filterout, **kwargs)
 
 class HF_Dataset(FilteredBase):
-  
+  """
+  Args:
+    `hf_dset` (`nlp.Dataset`)
+    `cols`: with one of the following signature:
+    - `cols`(`List[str]`): 
+      - if of length 1, regard the 1st element as text
+      - if of length 2, regrad the 1st element as text, 2nd as category
+    - `cols`(`Dict[Fastai2 Semantic Tesor]`): {`inp_col`:tensor type}: output sample as tuple of values of `inp_col` in order, and encode/decode with the tensor type,
+    `hf_tokenizer`: tokenizer of HuggingFace/Transformers
+    `pretty_show` (`Optional[bool]`, default:`False`): Show the original sentence instead of tokens.
+  """
   def __init__(self, hf_dset, cols, hf_tokenizer=None, pretty_show=False, n_inp=1):
     
     # some default setting for tensor type used in decoding
@@ -89,6 +131,9 @@ class HF_Dataset(FilteredBase):
     return tuple( self._decode(o_) for o_ in o )
 
   @typedispatch
+  def _decode(self, t:torch.Tensor): assert False, "You didn't specify a tensor type, thus not be able to decode and show."
+
+  @typedispatch
   def _decode(self, t:TensorText): 
     assert self.hf_tokenizer, "You should give huggingface tokenizer if you want to show batch."
     if self.pretty_show: text = self.hf_tokenizer.decode([idx for idx in t if idx != self.hf_tokenizer.pad_token_id])
@@ -104,14 +149,41 @@ class HF_Dataset(FilteredBase):
 class HF_Datasets(FilteredBase):
   _dl_type,_dbunch_type = HF_Dataloader,DataLoaders
   def __init__(self, hs_dsets: dict, *args, **kwargs):
+    """
+    Args:
+      `hs_dsets` (`Dict[nlp.Dataset]`): the order of dict items will be the order of `HF_Dataloader`s  
+    """
     self.hs_dsets = { split: HF_Dataset(dset, *args, **kwargs) for split, dset in hs_dsets.items()}
   def subset(self, i): return list(self.hs_dsets.values())[i]
   def __getitem__(self, split): return self.hs_dsets[split]
   @property
   def n_subsets(self): return len(self.hs_dsets)
+  def dataloaders(self, *args, cache_files=None, device='cpu', **kwargs):
+    """
+    Args:
+      `*args, **kwargs`: `for FilteredBase.dataloaders`
+      `cache_files` (`Optional[str]`, default:`None`): cache file names for `HF_Dataloader`s
+      `device` (`Optional[str]`, default:`'cpu'`): cuz will read a batch for test when creating `Dataloader`, so I set the default device to cpu to less the memory burden of cuda:0 
+    """
+    dl_kwargs = kwargs.pop('dl_kwargs', [{} for _ in range(len(self.hs_dsets))])
+    if cache_files:
+      assert len(cache_files) == len(self.hs_dsets)
+      for i, dl_kwarg in enumerate(dl_kwargs): dl_kwarg['cache_file'] = cache_files[i]
+    return super().dataloaders(*args, dl_kwargs=dl_kwargs, device=device, **kwargs)
 
 class AggregateTransform():
+  """
+  Inherit this class and implement `accumulate` and `create_example`
+  """
   def __init__(self, hf_dset, inp_cols, out_cols, init_attrs, drop_last=False):
+    """
+    Args:
+      `hf_dset` (`nlp.Dataset`)
+      `inp_cols` (`List[str]`)
+      `out_cols` (`List[str]`)
+      `init_attrs` (`List[str]`): name of attributes of children class that need to be their initial status when starts to aggregate dataset. i.e. Those defined in `__init__` and the value will changed during `accumulate`
+      `drop_last` (`Optional[bool]`, default: `False`): whether to drop the last accumulated sample.
+    """
     self.hf_dset = hf_dset
     self.inp_cols, self.out_cols =  inp_cols, out_cols
     # batched map need dataset be in python format
@@ -129,7 +201,7 @@ class AggregateTransform():
       for attr,val in zip(self.init_attrs, self.original_vals): setattr(self, attr, deepcopy(val))
 
     self.new_b = { c:[] for c in self.out_cols }
-    for z in tqdm(list(zip(*b.values())), leave=False):
+    for z in zip(*b.values()):
       self.accumulate(*z)
     
     # whehther put last example when it is last batch of `map`
@@ -143,10 +215,25 @@ class AggregateTransform():
     for col,val in example.items():
       self.new_b[col].append(val) 
 
-  def accumulate(self, *args): raise NotImplementedError
-  def create_example(self): raise NotImplementedError
+  def accumulate(self, *args):
+    """
+    Given a example, do `self.commit_example(self.create_example()) when a new aggregated sample is ready.`
+    Args:
+      `args`: nlp.Dataset[i][inp_col] for inp_col in self.inp_cols
+    """ 
+    raise NotImplementedError
+  
+  def create_example(self): 
+    """
+    When it is ready, create a sample (Dict[Any])
+    """
+    raise NotImplementedError
 
   def map(self, batch_size=1000, test_batch_size=20, **kwargs):
+    """
+    `batch_size`: see `nlp.Dataset.map`
+    `test_batch_size` (`int`, default=`20`): we infer the new schema of the aggregated dataset by the outputs of testing that passed first `test_batch_size` samples to aggregate. Depending how many sample aggreagted can you have a sample, this number might need to be higher.
+    """
     test_inputs, test_indices = self.hf_dset[:test_batch_size], list(range(test_batch_size))
     test_output = self(test_inputs,test_indices)
     for col,val in test_output.items(): assert val, f"Didn't get any example in test, you might want to try larger `test_batch_size` than {test_batch_size}"
@@ -154,6 +241,39 @@ class AggregateTransform():
     arrow_schema = pa.Table.from_pydict(test_output).schema
     return self.hf_dset.map(function=self, batched=True, batch_size=batch_size, with_indices=True,
                             arrow_schema=arrow_schema, **kwargs)
+
+class LMTransform(AggregateTransform):
+  def __init__(self, hf_dset, max_len, text_col, x_text_col='x_text', y_text_col='y_text', **kwargs):
+    self.text_col, self.x_text_col, self.y_text_col = text_col, x_text_col, y_text_col
+    self._max_len = max_len + 1
+    self.residual_len, self.new_text = self._max_len, []
+    super().__init__(hf_dset, inp_cols=[text_col], out_cols=[x_text_col, y_text_col], init_attrs=['residual_len', 'new_text'], **kwargs)
+    
+
+  def accumulate(self, text): # *inp_cols
+    "text: a list of indices"
+    usable_len = len(text)
+    cursor = 0
+    while usable_len != 0:
+      use_len = min(usable_len, self.residual_len)
+      self.new_text += text[cursor:cursor+use_len]
+      self.residual_len -= use_len
+      usable_len -= use_len
+      cursor += use_len
+      if self.residual_len == 0:
+        self.commit_example(self.create_example())   
+
+  def create_example(self):
+    # when read all data, the accumulated new_text might be less than two characters.
+    if len(self.new_text) >= 2: 
+      example = {self.x_text_col:self.new_text[:-1], self.y_text_col:self.new_text[1:]}
+    else:
+      example = None # mark "don't commit this"
+    # reset accumulators
+    self.new_text = []
+    self.residual_len = self._max_len
+
+    return example
 
 # To just take hidden features output
 class HF_ModelWrapper(nn.Module):
