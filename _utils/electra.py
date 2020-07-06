@@ -1,3 +1,4 @@
+import random
 from _utils.huggingface import AggregateTransform
 
 class ELECTRADataTransform(AggregateTransform):

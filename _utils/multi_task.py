@@ -357,3 +357,36 @@ class MultiTaskLearner(MyLearner):
       if self.task_names[self.current_task_idx] in self.tasks_dont_measure: continue
       super()._do_epoch_validate()
     self.current_task_idx = None
+
+"""
+#tasks = ['cola', 'sst2', 'mrpc', 'qqp', 'stsb', 'mnli', 'qnli', 'rte', 'wnli']
+tasks = ['mrpc','qqp']
+
+dls_s, pred_heads, loss_funcs, metrics_s = [], [], [], []
+for task in tasks:
+  # multi_dls
+  dls_s.append(glue_dls[task])
+  # multi_model
+  pred_heads.append(SentencePredictHead(electra_config.hidden_size, TARG_VOC_SIZE[task]))    
+  # multi_loss_func
+  loss_funcs.append(CrossEntropyLossFlat() if task != 'stsb' else MSELossFlat())
+  # multi_metrics
+  metrics_s.append([eval(f'{metric}()') for metric in METRICS[task]])
+
+multi_head_model = MultiHeadModel(HF_ModelWrapper.from_pretrained(ElectraModel, 'google/electra-small-discriminator', pad_id=hf_tokenizer.pad_token_id, sep_id=hf_tokenizer.sep_token_id), 
+                                  pred_heads)
+
+multi_learn = MultiTaskLearner(multi_dls=dls_s,
+                               opt_func=partial(Adam, eps=1e-6,),
+                               multi_model=multi_head_model,
+                               multi_loss_func=loss_funcs,
+                               task_weights=[0.5,0.5], # default as [1.] * number of tasks
+                               task_names=tasks,
+                               multi_metrics=metrics_s,
+                               splitter=partial(hf_electra_param_splitter,num_hidden_layers=electra_config.num_hidden_layers,
+                                                outlayer_name='pred_heads'),
+                               lr=get_layer_lrs(3e-4,0.8,electra_config.num_hidden_layers),
+                               )#.to_fp16()
+
+multi_learn.fit(2, 3e-4)
+"""
