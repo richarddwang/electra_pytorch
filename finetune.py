@@ -33,6 +33,7 @@ config = {k:vals[I] for k,vals in CONFIG.items()}
 config.update({
   'max_length': 512,
   'use_wsc': False,
+  'use_fp16': False,
 })
 
 # %% [markdown]
@@ -186,9 +187,20 @@ TARG_VOC_SIZE = {
     **{ task:3 for task in ['mnli','ax']}
 }
 
+# %%
+class MyMSELossFlat(BaseLoss):
+
+  def __init__(self,*args, axis=-1, floatify=True, low=None, high=None, **kwargs):
+    super().__init__(nn.MSELoss, *args, axis=axis, floatify=floatify, is_2d=False, **kwargs)
+    self.low, self.high = low, high
+
+  def decodes(self, x):
+    if self.low is not None: x = torch.max(x, x.new_full(x.shape, self.low))
+    if self.high is not None: x = torch.min(x, x.new_full(x.shape, self.high))
+    return x
 
 # %%
-def get_glue_learner(task, one_cycle=False, fp16=False, device='cuda:0', run_name=None):
+def get_glue_learner(task, one_cycle=False, device='cuda:0', run_name=None, checkpoint=None):
   
   # num_epochs
   if task == 'rte': num_epochs = 10
@@ -234,16 +246,19 @@ def get_glue_learner(task, one_cycle=False, fp16=False, device='cuda:0', run_nam
                   metrics=metrics,
                   splitter=splitter,
                   lr=layer_lrs,
-                  path='/home/yisiang/checkpoints',
+                  path=str(Path.home()/'checkpoints'),
                   model_dir='electra_glue',)
+  
+  # load checkpoint
+  if checkpoint: learn.load(checkpoint)
 
   # fp16
-  if fp16: learn = learn.to_fp16()
+  if config['use_fp16']: learn = learn.to_fp16()
 
   # 
   if run_name:
     id = run_name.split('_')[1]
-    wandb.init(project='electra-glue', name=run_name, config={'task': task, 'id':id, 'use_fp16':fp16, 'optim':'Adam', 'use_onecycle':False}, reinit=True)
+    wandb.init(project='electra-glue', name=run_name, config={'task': task, 'id':id, 'use_fp16':config['use_fp16'], 'optim':'Adam', 'use_onecycle':False}, reinit=True)
     learn.add_cb(WandbCallback(None, False))
 
   # one cycle / warm up + linear decay 
@@ -254,13 +269,15 @@ def get_glue_learner(task, one_cycle=False, fp16=False, device='cuda:0', run_nam
 # %%
 rand_id = random.randint(1,500)
 #rand_id = 79
-print(rand_id)
+pretrained_checkpoint = Path.home()/'checkpoints/electra_pretrain/7-06_10-31-49_100%.pth'
+pretrained_checkpoint = None
 for i in range(10):
   for task in ['cola', 'sst2', 'mrpc', 'stsb', 'qnli', 'rte', 'qqp', 'mnli', 'wnli']:
     if task not in ['wnli']: continue
     run_name = f"{task}_{rand_id}_{i}"
-    # run_name = None
-    learn, fit_fc = get_glue_learner(task, fp16=True, device='cuda:0', run_name=run_name) 
+    # run_name = None # set to None to skip wandb and model saving
+    learn, fit_fc = get_glue_learner(task, device='cuda:0', 
+                                      run_name=run_name, checkpoint=pretrained_checkpoint) 
     fit_fc()
     if run_name:
       wandb.join()
