@@ -110,11 +110,13 @@ class HF_Dataset():
     """
     Args:
       `hf_dset` (`nlp.Dataset`)
-      `cols` (`Optional`, default: `None`): with one of the following signature, be column_names of dataset if set `None`
+      `cols` (`Optional`, default: `None`): **specify columns whose values form a output sample in order**, and the semantic type of each column to encode/decode, with one of the following signature.
+      - `cols`(`Dict[Fastai Semantic Tensor]`): encode/decode {key} columns with {value} semantic tensor type. If {value} is `noop`, regard it as `TensorTuple` by default.
       - `cols`(`List[str]`): 
-        - if of length 1, regard the 1st element as text
-        - if of length 2, regrad the 1st element as text, 2nd as category
-      - `cols`(`Dict[Fastai2 Semantic Tesor]`): {`inp_col`:tensor type}: output sample as tuple of values of `inp_col` in order, and encode/decode with the tensor type,
+        - if of length 1, regard the 1st element as `TensorText`
+        - if of length 2, regard the 1st element as `TensorText`, 2nd element as `TensorCategory`
+        - Otherwise, regard all elements as `TensorTuple`
+      - `None`: use `hf_dset.column_names` and deal with it like `List[str]` above.
       `hf_toker`: tokenizer of HuggingFace/Transformers
       `neat_show` (`Optional[bool]`, default:`False`): Show the original sentence instead of tokens joined.
       `n_inp (`int`, default:1) the first `n_inp` columns of `cols` is x, and the rest is y .
@@ -341,8 +343,8 @@ class HF_TokenizeTfm(HF_BaseTransform):
     Args:
       `hf_dset` (`nlp.Dataset`)
       `cols`: with one of the following signature:
-        - `cols`(`List[str]`): tokenize the col into col
-        - `cols`(`Dict[str]`): tokenize the col(key) and into col(value)
+        - `cols`(`Dict[str]`): tokenize the every column named key into column named its value
+        - `cols`(`List[str]`): specify the name of columns to be tokenized, replace the original columns' data with tokenized one
       `hf_toker`: tokenizer of HuggingFace/Transformers.
     """
     if isinstance(cols, list): cols = {c:c for c in cols}
@@ -372,7 +374,7 @@ class AggregateTransform(HF_BaseTransform):
   """
   Inherit this class and implement `accumulate` and `create_example`
   """
-  def __init__(self, hf_dset, inp_cols, out_cols, init_attrs, drop_last=False, cache_dir=None):
+  def __init__(self, hf_dset, inp_cols, out_cols, init_attrs, drop_last=False):
     """
     Args:
       `hf_dset` (`nlp.Dataset` or `Dict[nlp.Dataset]`)
@@ -382,10 +384,12 @@ class AggregateTransform(HF_BaseTransform):
       `drop_last` (`Optional[bool]`, default: `False`): whether to drop the last accumulated sample.
       `cache_dir` (`str`, default=`None`): if `None`, it is the cache dir of the (first) dataset.
     """
-    super().__init__(hf_dset, cache_dir=cache_dir)
+    super().__init__(hf_dset)
     self.inp_cols, self.out_cols =  inp_cols, out_cols
     # batched map need dataset be in python format
-    hf_dset.set_format(type=None, columns=inp_cols)
+    if isinstance(hf_dset, dict):
+      for dset in hf_dset.values(): dset.set_format(type=None, columns=inp_cols) 
+    else: hf_dset.set_format(type=None, columns=inp_cols)
     # dealing with last sample
     self.last_idx = len(hf_dset) - 1
     self.drop_last = drop_last
@@ -452,12 +456,13 @@ class AggregateTransform(HF_BaseTransform):
 
 @delegates(AggregateTransform, but=["inp_cols", "out_cols", "init_attrs"])
 class LMTransform(AggregateTransform):
-  def __init__(self, hf_dset, max_len, text_col, x_text_col='x_text', y_text_col='y_text', **kwargs):
+  def __init__(self, tokenized_hf_dset, max_len, text_col, x_text_col='x_text', y_text_col='y_text', **kwargs):
     if isinstance(text_col, str): text_col = {text_col:['x_text','y_text']}
+    assert isinstance(text_col, dict)
     self.text_col, (self.x_text_col, self.y_text_col) = next(iter(text_col.items()))
     self._max_len = max_len + 1
     self.residual_len, self.new_text = self._max_len, []
-    super().__init__(hf_dset, inp_cols=[self.text_col], out_cols=[x_text_col, y_text_col], init_attrs=['residual_len', 'new_text'], **kwargs)
+    super().__init__(tokenized_hf_dset, inp_cols=[self.text_col], out_cols=[x_text_col, y_text_col], init_attrs=['residual_len', 'new_text'], **kwargs)
     
 
   def accumulate(self, text): # *inp_cols
@@ -488,15 +493,16 @@ class LMTransform(AggregateTransform):
 @delegates(AggregateTransform, but=["inp_cols", "out_cols", "init_attrs"])
 class ELECTRADataTransform(AggregateTransform):
   
-  def __init__(self, hf_dset, text_col, max_length, cls_idx, sep_idx, **kwargs):
+  def __init__(self, tokenized_hf_dset, text_col, max_length, cls_idx, sep_idx, **kwargs):
     if isinstance(text_col, str): text_col={text_col:text_col}
+    assert isinstance(text_col, dict)
     self.in_col, self.out_col = next(iter(text_col.items()))
     self._current_sentences = []
     self._current_length = 0
     self._max_length = max_length
     self._target_length = max_length
     self.cls_idx, self.sep_idx = cls_idx, sep_idx
-    super().__init__(hf_dset, inp_cols=[self.in_col], out_cols=[self.out_col], 
+    super().__init__(tokenized_hf_dset, inp_cols=[self.in_col], out_cols=[self.out_col], 
                     init_attrs=['_current_sentences', '_current_length', '_target_length'], **kwargs)
 
   # two functions required by AggregateTransform
