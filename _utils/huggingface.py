@@ -4,6 +4,7 @@ import json
 from tqdm import tqdm
 import pyarrow as pa
 from torch import nn
+from torch.nn.utils.rnn import pad_sequence
 import nlp
 from fastai2.text.all import *
 
@@ -11,20 +12,21 @@ from fastai2.text.all import *
 class MySortedDL(TfmdDL):
     "A `DataLoader` that goes throught the item in the order given by `sort_key`"
 
-    def __init__(self, dataset, pad_idx, srtkey_fc=None, filter_fc=False, cache_file=None, **kwargs):
+    def __init__(self, dataset, srtkey_fc=None, filter_fc=False, pad_idx=None, cache_file=None, **kwargs):
         """
         Args:
             `dataset`:
-            `srtkey_fc` (Callable[*args]->int): Get elements of a sample and return a sorting key. `None` for getting the length of first element, `False` to not sort 
-            `filter_fc` (Callable[*args]->bool): Get elements of a sample and return `False` to filter out the sample
+            `srtkey_fc` (`Callable[*args]->int`): Get elements of a sample and return a sorting key. `None` for getting the length of first element, `False` to not sort 
+            `filter_fc` (`Callable[*args]->bool`): Get elements of a sample and return `False` to filter out the sample
+            `pad_idx` (`int`, default: `None`): pad each attribute of samples to the max length of its max length within the batch. If `False`, do no padding. If `None`, use `dataset`'s `pad_idx` if it has, otherwise do no padding.
             `cache_file` (`Optional[str]`, default: `None`): Path of a json file to store the computed record of results of sort or filterout.
         """
         # Defaults
-        if pad_idx is not None: kwargs['before_batch'] = partial(pad_input_chunk, pad_idx=pad_idx, pad_first=False)
         if srtkey_fc is not False: srtkey_fc = lambda *x: len(x[0])
+        if pad_idx is None: pad_idx = getattr(dataset, 'pad_idx', False)
         cache_file = Path(cache_file) if cache_file else None
         idmap = list(range(len(dataset)))
-        
+
         # Save attributes
         super().__init__(dataset, **kwargs)
         store_attr(self, 'pad_idx,srtkey_fc,filter_fc,cache_file,idmap')
@@ -63,6 +65,10 @@ class MySortedDL(TfmdDL):
 
     def create_item(self, i): return self.dataset[self.idmap[i]]
 
+    def create_batch(self, samples):
+        if self.pad_idx is False: return super().create_batch(samples)
+        return tuple( pad_sequence(attr, batch_first=True, padding_value=self.pad_idx) if attr[0].shape else torch.stack(attr) for i, attr in enumerate(zip(*samples)))
+
     def get_idxs(self):
         idxs = super().get_idxs()
         if self.shuffle: return idxs
@@ -89,6 +95,60 @@ class MySortedDL(TfmdDL):
     def new(self, dataset=None, **kwargs):
         # We don't use filter_fc here cuz we can't don't validate certaion samples in dev/test set. 
         return super().new(dataset=dataset, pad_idx=self.pad_idx, srtkey_fc=self.srtkey_fc, filter_fc=False, **kwargs)
+
+"To pr"
+# only change "label" to "title"
+def my_show_title(o, ax=None, ctx=None, title=None, color='black', **kwargs):
+    "Set title of `ax` to `o`, or print `o` if `ax` is `None`"
+    ax = ifnone(ax,ctx)
+    if ax is None: print(o)
+    elif hasattr(ax, 'set_title'):
+        t = ax.title.get_text()
+        if len(t) > 0: o = t+'\n'+str(o)
+        ax.set_title(o, color=color)
+    elif isinstance(ax, pd.Series):
+        while title in ax: title += '_'
+        ax = ax.append(pd.Series({title: o}))
+    return ax
+
+class MyShowTitle:
+    "Base class that adds a simple `show`"
+    
+    @classmethod
+    def init(cls, data, **kwargs):
+        item = cls(data)
+        item._show_args = kwargs
+        return item
+
+    def show(self, ctx=None, **kwargs):
+        "Show self"
+        return my_show_title(str(self), ctx=ctx, **merge(self._show_args, kwargs))
+
+# it seems that python prioritising prior inherited class when finding methods   
+
+class MyTitledInt(MyShowTitle, Int): pass
+
+class MyTitledFloat(MyShowTitle, Float): pass
+
+# I created it
+class MyTitledBool(MyShowTitle, Int): # python says bool can't be base class
+    def show(self, ctx=None, **kwargs):
+        "Show self"
+        return my_show_title(str(bool(self)), ctx=ctx, **merge(self._show_args, kwargs))
+
+class MyTitledStr(MyShowTitle, Str):
+  def truncate(self, n):
+    "Truncate self to `n`"
+    words = self.split(' ')[:n]
+    return MyTitledStr.init(' '.join(words), **self._show_args)
+
+class MyTitledTuple(MyShowTitle, Tuple): pass
+
+class MyCategory(MyShowTitle, Str): pass
+
+class MyMultiCategory(MyShowTitle, L):
+    def show(self, ctx=None, sep=';', color='black', **kwargs):
+        return my_show_title(sep.join(self.map(str)), ctx=ctx, color=color, **merge(self._show_args, kwargs))
 
 """ Caution !!
 This function is inperfect.
@@ -136,6 +196,7 @@ class HF_Dataset():
       hf_dset.set_format( type='torch', columns=list(cols.keys()) )
 
     # store attributes
+    self.pad_idx = hf_toker.pad_token_id
     store_attr(self, "hf_dset,cols,n_inp,hf_toker,neat_show")
 
   def __getitem__(self, idx):
@@ -151,29 +212,33 @@ class HF_Dataset():
     if len(self.col_names) != len(o): return tuple( self._decode(o_) for o_ in o )
     return tuple( self._decode(o_, self.col_names[i]) for i, o_ in enumerate(o) )
 
-  def _decode_title(self, d, title_cls, title=None):
-    titled = title_cls(d)
-    if title: titled._show_args['label'] = title
-    return titled
+  def _decode_title(self, d, title_cls, title): 
+    if title: return title_cls.init(d, title=title)
+    else: return title_cls.init(d)
 
   @typedispatch
-  def _decode(self, t:torch.Tensor, title=None): return self._decode_title(t.tolist(), TitledTuple, title)
+  def _decode(self, t:torch.Tensor, title):
+    if t.shape: title_cls = MyTitledTuple
+    elif isinstance(t.item(),bool): title_cls = MyTitledBool # bool is also int, so check whether is bool first
+    elif isinstance(t.item(),float): title_cls = MyTitledFloat
+    elif isinstance(t.item(),int): title_cls = MyTitledInt
+    return self._decode_title(t.tolist(), title_cls , title)
 
   @typedispatch
-  def _decode(self, t:TensorText, title=None): 
+  def _decode(self, t:TensorText, title): 
     assert self.hf_toker, "You should give a huggingface tokenizer if you want to show batch."
     if self.neat_show: text = self.hf_toker.decode([idx for idx in t if idx != self.hf_toker.pad_token_id])
     else: text = ' '.join(self.hf_toker.convert_ids_to_tokens(t))
-    return self._decode_title(text, TitledStr, title)
+    return self._decode_title(text, MyTitledStr, title)
 
   @typedispatch
-  def _decode(self, t:LMTensorText, title=None): return self._decode[TensorText](self, t, title)
+  def _decode(self, t:LMTensorText, title): return self._decode[TensorText](self, t, title)
 
   @typedispatch
-  def _decode(self, t:TensorCategory, title=None): return self._decode_title(t.item(), Category, title)
+  def _decode(self, t:TensorCategory, title): return self._decode_title(t.item(), MyCategory, title)
 
   @typedispatch
-  def _decode(self, t:TensorMultiCategory, title=None): return self._decode_title(t.tolist(), MultiCategory, title)
+  def _decode(self, t:TensorMultiCategory, title): return self._decode_title(t.tolist(), MyMultiCategory, title)
 
   def __getattr__(self, name):
     "If not defined, let the nlp.Dataset in it act for us."
