@@ -4,13 +4,13 @@ import en_core_web_lg # python -m spacy download en_core_web_lg
 spnlp = en_core_web_lg.load()
 import torch
 from fastai2.text.all import *
-from _utils.huggingface import HF_BaseTransform
+from _utils.huggingface import HF_BaseTransform, HF_Model
 
 @delegates(but=["out_cols"])
 class WSCTrickTfm(HF_BaseTransform):
 
-  def __init__(self, hf_dset, hf_toker, extract_candidates=True, exclude_false_sample=False, **kwargs):
-    super().__init__(hf_dset, out_cols=['inp_ids', 'span', 'label'], **kwargs)
+  def __init__(self, hf_dset, hf_toker, **kwargs):
+    super().__init__(hf_dset, out_cols=['prefix', 'suffix', 'cands', 'cand_lens', 'label'], **kwargs)
     self.tokenizer = hf_toker
     self.tokenizer_config = hf_toker.pretrained_init_configuration
 
@@ -43,8 +43,9 @@ class WSCTrickTfm(HF_BaseTransform):
     sample['prefix'] = self.tokenizer.encode(prefix)[:-1] # no SEP
     sample['suffix'] = self.tokenizer.encode(suffix)[1:] # no CLS
     cands = [self.simple_encode(sample['span1_text'])] + [self.simple_encode(cand) for cand in cands]
-    sample['cand_lens'] = [len(cand) for cand in cands]
     sample['cands'] = reduce(operator.add, cands, []) # flatten list, into a 1d token ids
+    sample['cand_lens'] = [len(cand) for cand in cands]
+    # sample already have 'label'
 
     return sample
 
@@ -91,73 +92,88 @@ def filter_noun_chunks(chunks, exclude_pronouns=False, exclude_query=None, exact
 
     return chunks
 
-def pad_all_input_chunk(samples, n, pad_idx, seq_len=72):
-  "Pad n element to the first of `samples` by adding padding by chunks of size `seq_len`"
-  max_lens = [max([len(s[i]) for s in samples]) for i in range(n)]
-  def _f(x, max_len):
-    l = max_len - x.shape[0]
-    pad_chunk = x.new_zeros((l//seq_len) * seq_len) + pad_idx
-    pad_res   = x.new_zeros(l % seq_len) + pad_idx
-    x1 = torch.cat([x, pad_res, pad_chunk])
-    return retain_type(x1, x)
-  return [(*( _f(s[i], max_len) for i, max_len in enumerate(max_lens)), *s[n:]) for s in samples]
-
-class WSCTrickCB(Callback):
-  def __init__(self, pad_idx):
+class ELECTRAWSCTrickModel(nn.Module):
+  def __init__(self, discriminator, pad_idx, toker):
+    super().__init__()
+    self.model = discriminator
     self.pad_idx = pad_idx
+    self.tok = toker
   
-  def begin_batch(self):
-    batch_size = len(self.xb[0])
-    scores = []; max_n_cand = 0
+  def forward(self, *xb):
+    """
+    prefix: (B, L_p)
+    suffix: (B, L_s)
+    cands: (B, L_c)
+    cand_lens: (B, L_cl)
+    """
+    batch_size = xb[0].shape[0]
+
+    all_scores = []
+    n_cands = []
     for i in range(batch_size):
-      prefix, suffix, cands, cand_lens = self.depad(self.xb[0][i]), self.depad(self.xb[1][i]), self.depad(self.xb[2][i]), self.depad(self.xb[3][i])
-      # split into list of tensors, ith has length of cand_lens[i]
-      cands = cands.split(cand_lens.tolist())
-      if len(cands) > max_n_cand: max_n_cand = len(cands)
+      # unpad
+      prefix, suffix, cands, cand_lens = self.depad(xb[0][i]), self.depad(xb[1][i]), self.depad(xb[2][i]), self.depad(xb[3][i])
+      # unpack and pad into (#candidate, max_len)
+      cands = cands.split(cand_lens.tolist()) # split into list of tensors, ith has length of cand_lens[i]
       max_len = max(len(cand) for cand in cands) + len(prefix) + len(suffix)
       sents, masks = [], []
       for cand in cands:
         pad_len = max_len - len(prefix) - len(suffix) - len(cand)
         sents.append( torch.cat([prefix,cand,suffix,cand.new_full((pad_len,),self.pad_idx)]) )
         masks.append( torch.cat([cand.new_zeros(len(prefix)),cand.new_ones(len(cand)),cand.new_zeros(max_len-len(prefix)-len(cand))]) )
-      sents = torch.stack(sents)
-      masks = torch.stack(masks)
-      logits = self.model(sents) # (#candidate, L, vocab_size)
-      lprobs = F.log_softmax(logits, dim=-1, dtype=torch.float) # (#candidate, L, vocab_size)
-      # choose only the probs related to tokens
-      _scores = lprobs.gather(dim=-1, index=sents.unsqueeze(-1)).squeeze(-1) # (#candidate, L)
-      # average scores for the candidate span
-      #bk()
-      _scores = (_scores * masks).sum(dim=-1) / masks.sum(dim=-1) # (#candidate,)
-      scores.append(_scores)
-    scores = [torch.cat([_scores, _scores.new_full((max_n_cand-len(_scores),), -float('inf'))]) for _scores in scores]
-    scores = torch.stack(scores) # (B, max_n_cand)
-
-    self.learn.pred = scores;                                                self.learn('after_pred')
-    if len(self.learn.yb) == 0: raise CancelBatchException
-    self.learn.loss = self.learn.loss_func(self.learn.pred, *self.learn.yb); self.learn('after_loss')
-    if not self.learn.training: raise CancelBatchException
-    self.learn.loss.backward();                                              self.learn('after_backward')
-    self.learn.opt.step();                                                   self.learn('after_step')
-    self.learn.opt.zero_grad()
-    raise CancelBatchException
+      sents = torch.stack(sents) # (#candidate, max_len)
+      masks = torch.stack(masks) # (#candidate, max_len)
+      # get discrimiator scores for each candidate
+      logits = self.model(sents) # (#candidate, max_len)
+      scores = (logits * masks).sum(dim=-1) # (#candidate,)
+      scores = scores / masks.sum(dim=-1)
+      # save
+      all_scores.append(scores)
+      n_cands.append(scores.shape[0])
+    # repack
+    all_scores = torch.cat(all_scores) # (#total candidate in this batch,)
+    n_cands = torch.tensor(n_cands, device=all_scores.device) # (B,)
+    return all_scores, n_cands
 
   def depad(self, tensor):
     mask = tensor != self.pad_idx
     return tensor.masked_select(mask)
 
-class WSCTrickLoss():
-  def __call__(self, inp, targ):
-    return F.cross_entropy(inp, targ)
+def wsc_trick_predict(preds):
+  """
+  all_scores: (#total candidates in the dataset,)
+  n_cands: (#samples in the dataset,)
+  """
+  all_scores, n_cands = preds
+  predicted = []
+  for scores in all_scores.split(n_cands.tolist()):
+    query_score  = scores[0]
+    other_scores = scores[1:]
+    predicted.append((query_score <= other_scores).all())
+  return torch.stack(predicted).int()
+
+class ELECTRAWSCTrickLoss():
+  def __init__(self):
+    self.criterion = nn.BCEWithLogitsLoss()
   
-  def decodes(self, scores):
-    # scores: list of (n_cand)
-    scores = self._batchize(scores) # (n_sample, max_num_cand)
-    query_scores = scores[:,0].unsqueeze(-1) # (n_sample,1)
-    labels = (scores[:,1:] < query_scores).all(dim=1) # (n_sample,)
-    return labels
-  
-  def _batchize(self, tensors):
-    max_len = max([len(t) for t in tensors])
-    tensors = [torch.cat([t,t.new_full((max_len-len(t),), -float('inf'))]) for t in tensors]
-    return torch.stack(tensors)
+  def __call__(self, x, y):
+    all_scores, n_cands = x
+    all_labels = []
+    for scores in all_scores.split(n_cands.tolist()):
+      n_cand = len(scores)
+      labels = scores.new_ones(n_cand)
+      labels[0] = 0.
+      all_labels.append(labels)
+    all_labels = torch.cat(all_labels) # (#total candidate in this batch,)
+    return self.criterion(all_scores, all_labels)
+
+  def decodes(self, preds): return wsc_trick_predict(preds)
+
+def accuracy_electra_wsc_trick(preds, targs):
+  predicts = wsc_trick_predict(preds)
+  return (predicts == targs).float().mean()
+
+def wsc_trick_merge(outs):
+  all_scores = torch.stack([out[0] for out in outs]).mean(dim=0)
+  n_cands = outs[0][1]
+  return all_scores, n_cands
