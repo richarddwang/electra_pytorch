@@ -20,12 +20,13 @@ class RunSteps(Callback):
     else:
       assert '{percent}' in base_name
       save_points = [ s if isinstance(s,int) else int(n_steps*s) for s in save_points ]
+      for sp in save_points: assert sp != 1, "Are you sure you want to save after 1 steps, instead of 1.0 * num_steps ?"
       assert max(save_points) <= n_steps
     store_attr(self, 'n_steps,save_points,base_name,no_val')
 
   def after_batch(self):
     if self.train_iter in self.save_points:
-      percent = round((self.train_iter/self.n_steps)*100)
+      percent = (self.train_iter/self.n_steps)*100
       self.learn.save(self.base_name.format(percent=f'{percent}%'))
     if self.train_iter == self.n_steps:
       raise CancelFitException
@@ -111,3 +112,19 @@ class Timer(RunSteps):
     times = torch.tensor(times)[:,self.ignore_first_n:]
     total_m, total_s = times.sum(0).mean().item(), times.sum(0).std().item()
     print(f"Total: avg {round(total_m, self.precision)} secs ± stdev {round(total_s, self.precision)} secs")
+
+class MyConfig(dict):
+  def __getattr__(self, name): return self[name]
+  def __setattr__(self, name, value): self[name] = value
+
+def load_part_model(file, model, prefix, device=None, strict=True):
+  "assume `model` is part of (child attribute at any level) of model whose states save in `file`."
+  distrib_barrier()
+  if prefix[-1] != '.': prefix += '.'
+  if isinstance(device, int): device = torch.device('cuda', device)
+  elif device is None: device = 'cpu'
+  state = torch.load(file, map_location=device)
+  hasopt = set(state)=={'model', 'opt'}
+  model_state = state['model'] if hasopt else state
+  model_state = {k[len(prefix):] : v for k,v in model_state.items() if k.startswith(prefix)}
+  get_model(model).load_state_dict(model_state, strict=strict)

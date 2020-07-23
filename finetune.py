@@ -15,34 +15,50 @@ import wandb
 from fastai2.callback.wandb import WandbCallback
 from _utils.would_like_to_pr import *
 from _utils.huggingface import *
-from _utils.wsc import *
+from _utils.utils import *
 
 
 # %%
-SIZE = 'small'
-assert SIZE in ['small', 'base', 'large']
-hf_tokenizer = ElectraTokenizerFast.from_pretrained(f"google/electra-{SIZE}-discriminator")
-electra_config = ElectraConfig.from_pretrained(f'google/electra-{SIZE}-discriminator')
-CONFIG = {
-  'lr': [3e-4, 1e-4, 5e-5],
-  'layer_lr_decay': [0.8,0.8,0.9],
-}
-I = ['small', 'base', 'large'].index(SIZE)
-config = {k:vals[I] for k,vals in CONFIG.items()}
-
-config.update({
-  'max_length': 512,
-  'use_wsc': False,
-  'use_fp16': False,
+c = MyConfig({
+  # device to train and test
+  'device': 'cuda:3', # specify List[int] to use multi gpu (data parallel), None for using all gpu devices
+  # the id that in the name of runs which are in the same group (to choose the best from 10 runs and ..)
+  'group_id': random.randint(1,999), # None to not save checkpoint and not create wandb run 
+  # checkpoint of ELECTRA from pretrain.py, note that only discriminator part of it will be extracted and used
+  'pretrained_checkpoint': None,# Path.home()/'checkpoints/electra_pretrain/7-19_08-31-14_6.25%.pth', # None to use checkpoints hubbed on Huggingface
+  # whether to use wnli trick described in the paper
+  'wsc_trick': True,
+  # size of ELECTRA
+  'size': 'small',
+  'max_length': 512, # 128 only if ELECTRA-small (note that all public models are ++model which use 512)
+  # where to cache the data
+  'cache_dir': Path.home()/'datasets', # ! should be `pathlib.Path` istance
+  # where to save finetuneing checkpoints
+  'ckp_dir': Path.home()/'checkpoints/electra_glue', # ! should be `pathlib.Path` istance
+  # whether to do finetune or test
+  'do_finetune': True, # True, to do only finetuning, False to do only test
+  # cache_dir/glue/test/out_dir to put output files of testing.
+  'out_dir': "hf_small_test" ,
+  # finetuning checkpoint for testing. These will become "ckp_dir/{task}_{group_id}_{th_run}.pth"
+  'th_run': {'cola': 9, 'sst2': 1, 'mrpc': 6, 'qqp': 2, 'stsb': 4, 'qnli': 1, 'rte': 4, 'mnli': 5, 'ax': 5,
+             'wnli': [22,3,10,14,8,0,17,20,2,6],
+            }
 })
+
+if c.size == 'small' and c.pretrained_checkpoint: assert c.max_length == 128, "Make sure max_length is 128 for ELECTRA-small, or comment this line if you know what you are doing."
+if c.pretrained_checkpoint is None: assert c.max_length == 512, "All public models of ELECTRA is ++, and use max_length 512 when finetuning on GLUE"
+if c.wsc_trick:
+  from _utils.wsc_trick import * # importing spacy model takes time
+if c.size == 'small': c.lr = 3e-4; c.layer_lr_decay = 0.8
+elif c.size == 'base': c.lr = 1e-4; c.layer_lr_decay = 0.8
+elif c.size == 'large': c.lr = 5e-5; c.layer_lr_decay = 0.9
+else: raise ValueError(f"Invalid size {c.size}")
+hf_tokenizer = ElectraTokenizerFast.from_pretrained(f"google/electra-{c.size}-discriminator")
+electra_config = ElectraConfig.from_pretrained(f'google/electra-{c.size}-discriminator')
+c.cache_dir.mkdir(parents=True, exist_ok=True)
 
 # %% [markdown]
 # # 1. Prepare data
-
-# %%
-cache_dir = Path.home()/'datasets'
-cache_dir.mkdir(parents=True, exist_ok=True)
-
 # %% [markdown]
 # ## 1.1 Download and Preprocess
 
@@ -81,31 +97,34 @@ def tokenize_sents_max_len(example, cols, max_length):
 glue_dsets = {}; glue_dls = {}
 for task in ['cola', 'sst2', 'mrpc', 'qqp', 'stsb', 'mnli', 'qnli', 'rte', 'wnli', 'ax']:
   # General case and special case for WSC
-  if task == 'wnli' and config['use_wsc']:
+  if task == 'wnli' and c.wsc_trick:
     benchmark, subtask = 'super_glue', 'wsc.fixed'
     # samples in all splits are all less than 128-2, so don't need to worry about max_length
-    Tfm = partial(WSCTransform, hf_toker=hf_tokenizer)
-    cols = {'inp_ids':TensorText, 'span': noop, 'label':TensorCategory}
-    n_inp=2
-    cache_name = "tokenized_{split}.arrow"
+    Tfm = partial(WSCTrickTfm, hf_toker=hf_tokenizer)
+    cols = {'prefix':TensorText, 'suffix':TensorText, 'cands':TensorText, 'cand_lens':noop, 'label':TensorCategory}
+    n_inp=4
+    cache_name = "tricked_{split}.arrow"
   else:
     benchmark, subtask = 'glue', task
-    tok_func = partial(tokenize_sents_max_len, cols=textcols(task), max_length=config['max_length'])
+    tok_func = partial(tokenize_sents_max_len, cols=textcols(task), max_length=c.max_length)
     Tfm = partial(HF_Transform, func=tok_func)
     cols = ['inp_ids', 'label']
     n_inp=1
-    cache_name = f"tokenized_{config['max_length']}_{{split}}.arrow"
+    cache_name = f"tokenized_{c.max_length}_{{split}}.arrow"
   # load / download datasets.
-  dsets = nlp.load_dataset(benchmark, subtask, cache_dir=cache_dir)
+  dsets = nlp.load_dataset(benchmark, subtask, cache_dir=c.cache_dir)
   # There is two samples broken in QQP training set
   if task=='qqp': dsets['train'] = dsets['train'].filter(lambda e: e['question2']!='',
-                                          cache_file_name=str(cache_dir/'glue/qqp/1.0.0/fixed_train.arrow'))
+                                          cache_file_name=str(c.cache_dir/'glue/qqp/1.0.0/fixed_train.arrow'))
+  # 
+  if task=='wnli' and c.wsc_trick: dsets['train'] = dsets['train'].filter(lambda e: e['label']==1,
+                 cache_file_name=str(c.cache_dir/'super_glue/wsc.fixed/1.0.2/filtered_tricked_train.arrow'))
   # load / make tokenized datasets
   glue_dsets[task] = Tfm(dsets).map(cache_name=cache_name)
   # load / make dataloaders
   hf_dsets = HF_Datasets(glue_dsets[task], cols=cols, hf_toker=hf_tokenizer, n_inp=n_inp)
   dl_cache_name = cache_name.replace('tokenized', 'dl').replace('.arrow', '.json')
-  glue_dls[task] = hf_dsets.dataloaders(bs=32, pad_idx=hf_tokenizer.pad_token_id, cache_name=dl_cache_name)
+  glue_dls[task] = hf_dsets.dataloaders(bs=32, cache_name=dl_cache_name)
 
 # %% [markdown]
 # # 2. Finetuning model
@@ -188,48 +207,42 @@ TARG_VOC_SIZE = {
 }
 
 # %%
-class MyMSELossFlat(BaseLoss):
-
-  def __init__(self,*args, axis=-1, floatify=True, low=None, high=None, **kwargs):
-    super().__init__(nn.MSELoss, *args, axis=axis, floatify=floatify, is_2d=False, **kwargs)
-    self.low, self.high = low, high
-
-  def decodes(self, x):
-    if self.low is not None: x = torch.max(x, x.new_full(x.shape, self.low))
-    if self.high is not None: x = torch.min(x, x.new_full(x.shape, self.high))
-    return x
-
-# %%
-def get_glue_learner(task, one_cycle=False, device='cuda:0', run_name=None, checkpoint=None):
+def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
   
   # num_epochs
   if task == 'rte': num_epochs = 10
   else: num_epochs = 3
 
   # dls
-  dls = glue_dls[task].to(torch.device(device))
-  # model
-  if task=='wnli' and config['use_wsc']:
-    model = ELECTRAWSCModel(HF_Model(ElectraForPreTraining, f"google/electra-{SIZE}-discriminator", hf_tokenizer))
+  dls = glue_dls[task]
+  if isinstance(c.device, str): dls.to(torch.device(c.device))
+  elif isinstance(c.device, list): dls.to(torch.device('cuda', c.device[0]))
+  else: dls.to(torch.device('cuda:0'))
+  # load model
+  if c.pretrained_checkpoint: 
+    discriminator = HF_Model(ElectraForPreTraining, electra_config, hf_tokenizer)
+    load_part_model(c.pretrained_checkpoint, discriminator, 'discriminator')
   else:
-    model = nn.Sequential(HF_Model(ElectraModel, f"google/electra-{SIZE}-discriminator", hf_tokenizer),
+    discriminator = HF_Model(ElectraForPreTraining, f"google/electra-{c.size}-discriminator", hf_tokenizer)
+  # model
+  if task=='wnli' and c.wsc_trick:
+    model = ELECTRAWSCTrickModel(discriminator, hf_tokenizer.pad_token_id)
+  else: # take only base model and mount an output layer
+    model = nn.Sequential(HF_Model(discriminator.model.electra, hf_toker=hf_tokenizer), 
                           SentencePredictHead(electra_config.hidden_size, targ_voc_size=TARG_VOC_SIZE[task]))
   # loss func
-  if task == 'stsb': loss_fc = MSELossFlat()
-  elif task=='wnli' and config['use_wsc']: loss_fc = BCEWithLogitsLossFlat()
+  if task == 'stsb': loss_fc = MyMSELossFlat(low=0.0, high=5.0)
+  elif task=='wnli' and c.wsc_trick: loss_fc = ELECTRAWSCTrickLoss()
   else: loss_fc = CrossEntropyLossFlat()
   # metrics
   metrics = [eval(f'{metric}()') for metric in METRICS[task]]
-  def sigmoid_acc(inps,targ):
-    pred = torch.sigmoid(inps) > 0.5
-    return (pred == targ).float().mean()
-  if task=='wnli' and config['use_wsc']: metrics = [sigmoid_acc]
+  if task=='wnli' and c.wsc_trick: metrics = [accuracy_electra_wsc_trick]
   # learning rate
   splitter = partial(hf_electra_param_splitter, 
-                  num_hidden_layers=electra_config.num_hidden_layers,
-                  outlayer_name= 'discriminator_predictions' if task=='wnli' and config['use_wsc'] else '1')
-  layer_lrs = get_layer_lrs(lr=config['lr'],
-                    decay_rate_of_depth=config['layer_lr_decay'],
+                     num_hidden_layers=electra_config.num_hidden_layers,
+                     outlayer_name= 'discriminator_predictions' if task=='wnli' and c.wsc_trick else '1')
+  layer_lrs = get_layer_lrs(lr=c.lr,
+                    decay_rate_of_depth=c.layer_lr_decay,
                     num_hidden_layers=electra_config.num_hidden_layers,)
   lr_shedule = ParamScheduler({'lr': partial(linear_warmup_and_decay,
                                             lr_max=np.array(layer_lrs),
@@ -237,28 +250,28 @@ def get_glue_learner(task, one_cycle=False, device='cuda:0', run_name=None, chec
                                             decay_power=1,
                                             warmup_pct=0.1,
                                             total_steps=num_epochs*(len(dls.train)))})
-  
+
   
   # learner
   learn = Learner(dls, model,
                   loss_func=loss_fc, 
-                  opt_func=partial(Adam, eps=1e-6,),
+                  opt_func=partial(Adam, eps=1e-6, wd=0.),
                   metrics=metrics,
-                  splitter=splitter,
-                  lr=layer_lrs,
-                  path=str(Path.home()/'checkpoints'),
-                  model_dir='electra_glue',)
+                  splitter=splitter if not inference else trainable_params,
+                  lr=layer_lrs if not inference else defaults.lr,
+                  path=str(c.ckp_dir.parent),
+                  model_dir=c.ckp_dir.name,)
   
-  # load checkpoint
-  if checkpoint: learn.load(checkpoint)
+  # multi gpu
+  if isinstance(c.device, list) or c.device is None:
+    learn.model = nn.DataParallel(learn.model, device_ids=c.device)
 
   # fp16
-  if config['use_fp16']: learn = learn.to_fp16()
+  if c.device != 'cpu': learn = learn.to_fp16()
 
-  # 
+  # wandb
   if run_name:
-    id = run_name.split('_')[1]
-    wandb.init(project='electra-glue', name=run_name, config={'task': task, 'id':id, 'use_fp16':config['use_fp16'], 'optim':'Adam', 'use_onecycle':False}, reinit=True)
+    wandb.init(project='electra-glue', name=run_name, config={'task': task, 'optim':'Adam', **c}, reinit=True)
     learn.add_cb(WandbCallback(None, False))
 
   # one cycle / warm up + linear decay 
@@ -267,18 +280,115 @@ def get_glue_learner(task, one_cycle=False, device='cuda:0', run_name=None, chec
 
 
 # %%
-rand_id = random.randint(1,500)
-#rand_id = 79
-pretrained_checkpoint = Path.home()/'checkpoints/electra_pretrain/7-06_10-31-49_100%.pth'
-pretrained_checkpoint = None
-for i in range(10):
-  for task in ['cola', 'sst2', 'mrpc', 'stsb', 'qnli', 'rte', 'qqp', 'mnli', 'wnli']:
-    if task not in ['wnli']: continue
-    run_name = f"{task}_{rand_id}_{i}"
-    # run_name = None # set to None to skip wandb and model saving
-    learn, fit_fc = get_glue_learner(task, device='cuda:0', 
-                                      run_name=run_name, checkpoint=pretrained_checkpoint) 
-    fit_fc()
-    if run_name:
-      wandb.join()
-      learn.save(run_name)
+if c.do_finetune:
+  for i in range(5):
+    for task in ['cola', 'sst2', 'mrpc', 'stsb', 'qnli', 'rte', 'qqp', 'mnli', 'wnli']:
+      if task in ['wnli']: continue # to only do some tasks
+      if c.group_id: run_name = f"{task}_{c.group_id}_{i}";
+      else: run_name = None; print(task)
+      learn, fit_fc = get_glue_learner(task, run_name)
+      fit_fc()
+      if run_name:
+        wandb.join()
+        learn.save(run_name)
+
+# %% [markdown]
+# ## 3.3 Predict the test set
+
+# %%
+def get_identifier(task, split):
+  map = {'cola': 'CoLA', 'sst2':'SST-2', 'mrpc':'MRPC', 'qqp':'QQP', 'stsb':'STS-B', 'qnli':'QNLI', 'rte':'RTE', 'wnli':'WNLI', 'ax':'AX'}
+  if task =='mnli' and split == 'test_matched': return 'MNLI-m'
+  elif task == 'mnli' and split == 'test_mismatched': return 'MNLI-mm'
+  else: return map[task]
+
+class Ensemble(nn.Module):
+  def __init__(self, models, device='cuda:0', merge_out_fc=None):
+    super().__init__()
+    self.models = nn.ModuleList( m.cpu() for m in models )
+    self.device = device
+    self.merge_out_fc = merge_out_fc
+  
+  def to(self, device): 
+    self.device = device
+    return self
+  def getitem(self, i): return self.models[i]
+  
+  def forward(self, *args, **kwargs):
+    outs = []
+    for m in self.models:
+      m.to(self.device)
+      out = m(*args, **kwargs)
+      m.cpu()
+      outs.append(out)
+    if self.merge_out_fc:
+      outs = self.merge_out_fc(outs)
+    else:
+      outs = torch.stack(outs)
+      outs = outs.mean(dim=0)
+    return outs
+
+def load_model_(learn, files, device=None, **kwargs):
+  "if multiple file passed, then load and create an ensemble. Load normally otherwise"
+  merge_out_fc = kwargs.pop('merge_out_fc', None)
+  if not isinstance(files, list): 
+    learn.load(files, device=device, **kwargs)
+    return
+  if device is None: device = learn.dls.device
+  model = learn.model.cpu()
+  models = [model, *(deepcopy(model) for _ in range(len(files)-1)) ]
+  for f,m in zip(files, models):
+    file = join_path_file(f, learn.path/learn.model_dir, ext='.pth')
+    load_model(file, m, learn.opt, device='cpu', **kwargs)
+  learn.model = Ensemble(models, device, merge_out_fc)
+  return learn
+
+
+# %%
+def predict_test(task, checkpoint, dl_idx=-1, output_dir=None, device='cuda:0'):
+  if output_dir is None: output_dir = c.cache_dir/'glue/test'
+  output_dir = Path(output_dir)
+  output_dir.mkdir(exist_ok=True)
+  device = torch.device(device)
+
+  # load checkpoint and get predictions
+  learn, _ = get_glue_learner(task, device=device, inference=True)
+  if task == 'wnli' and config['wsc_trick']:
+    load_model_(learn, checkpoint, merge_out_fc=wsc_trick_merge)
+  else:
+    load_model_(learn, checkpoint)
+  results = learn.get_preds(ds_idx=dl_idx, with_decoded=True)
+  preds = results[-1] # preds -> (predictions logits, targets, decoded prediction)
+
+  # decode target class index to its class name 
+  if task in ['mnli','ax']:
+    preds = [ ['entailment','neutral','contradiction'][p] for p in preds]
+  elif task in ['qnli','rte']: 
+    preds = [ ['entailment','not_entailment'][p] for p in preds ]
+  elif task == 'wnli' and c.wsc_trick:
+    preds = preds.to(dtype=torch.long).tolist()
+  else: preds = preds.tolist()
+    
+  # form test dataframe and save
+  test_df = pd.DataFrame( {'index':range(len(list(glue_dsets[task].values())[dl_idx])), 'prediction': preds} )
+  split = list(glue_dsets['mnli'].keys())[dl_idx]
+  identifier = get_identifier(task, split)
+  test_df.to_csv( output_dir/f'{identifier}.tsv', sep='\t' )
+  return test_df
+
+
+# %%
+if not c.do_finetune:
+  for task, th in c.th_run.items():
+    if task not in ['wnli']: continue # to do only some task
+    print(task)
+    # ax use mnli ckp
+    if isinstance(th, int):
+      ckp = f"{task}_{c.group_id}_{th}" if task != 'ax' else f"mnli_{c.group_id}_{th}"
+    else:
+      ckp = [f"{task}_{c.group_id}_{i}" if task != 'ax' else f"mnli_{c.group_id}_{i}" for i in th]
+    # run test for all testset in this task
+    dl_idxs = [-1, -2] if task=='mnli' else [-1]
+    for dl_idx in dl_idxs:
+      df = predict_test(task, ckp, dl_idx, output_dir=c.cache_dir/f'glue/test/{c.out_dir}')
+

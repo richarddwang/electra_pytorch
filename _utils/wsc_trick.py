@@ -93,11 +93,10 @@ def filter_noun_chunks(chunks, exclude_pronouns=False, exclude_query=None, exact
     return chunks
 
 class ELECTRAWSCTrickModel(nn.Module):
-  def __init__(self, discriminator, pad_idx, toker):
+  def __init__(self, discriminator, pad_idx):
     super().__init__()
     self.model = discriminator
     self.pad_idx = pad_idx
-    self.tok = toker
   
   def forward(self, *xb):
     """

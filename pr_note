@@ -1,0 +1,26 @@
+a function of convert_tokens_to_ids(tokenize())
+test map/ map on assigned size of dataset
+check output column is not in remove columns
+
+import random
+import torch
+from torch.nn.utils.rnn import pad_sequence
+from fastai2.text.all import *
+
+samples = []
+for _ in range(128):
+  length = random.randint(80,120)
+  samples.append((torch.randint(1, 30000, (length,)), torch.tensor(length)))
+
+padded_samples = pad_input_chunk(samples, pad_idx=0, pad_first=False)
+b = fa_collate(padded_samples)
+
+bb = tuple( pad_sequence(attr, batch_first=True, padding_value=0) if attr[0].shape else torch.stack(attr) for i, attr in enumerate(zip(*samples)))
+
+for b_attr, bb_attr in zip(b,bb): assert torch.equal(b_attr)
+
+%timeit fa_collate(pad_input_chunk(samples, pad_idx=0, pad_first=False))
+#5.62 ms ± 29.4 µs per loop (mean ± std. dev. of 7 runs, 100 loops each)
+
+%timeit tuple( pad_sequence(attr, batch_first=True, padding_value=0) if attr[0].shape else torch.stack(attr) for i, attr in enumerate(zip(*samples)))
+# 1.38 ms ± 79.5 µs per loop (mean ± std. dev. of 7 runs, 1000 loops each)

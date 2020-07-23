@@ -1,103 +1,93 @@
 # To add a new cell, type '# %%'
 # To add a new markdown cell, type '# %% [markdown]'
 # %%
-from IPython.core.debugger import set_trace as bk
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from functools import partial
+from datetime import datetime, timezone, timedelta
+from IPython.core.debugger import set_trace as bk
+import pandas as pd
 import torch
 from torch import nn
-import wandb
+import torch.nn.functional as F
 import nlp
-from transformers import ElectraForMaskedLM, ElectraForPreTraining, ElectraTokenizerFast, ElectraConfig
-from fastai2.callback.wandb import *
+from transformers import ElectraModel, ElectraConfig, ElectraTokenizerFast, ElectraForMaskedLM,ElectraForPreTraining
 from fastai2.text.all import *
+import wandb
+from fastai2.callback.wandb import WandbCallback
+from _utils.would_like_to_pr import *
 from _utils.huggingface import *
 from _utils.utils import *
-from _utils.would_like_to_pr import LabelSmoothingCrossEntropyFlat
 
 
 # %%
-SIZE = 'small'
-assert SIZE in ['small', 'base', 'large']
-I = ['small', 'base', 'large'].index(SIZE)
-CONFIG = {
-  'mask_prob':[0.15, 0.15, 0.25],
-  'lr':[5e-4, 2e-4, 2e-4],
-  'bs':[128, 256, 2048],
-  'steps':[10**6, 766*1000, 400*1000],
-  'max_length':[128, 512, 512],
-}
-config = {k:vs[I] for k,vs in CONFIG.items()}
-config.update({
-  'use_fp16': True,
-  'sort_sample': True,
-  'smooth_label': True,
-  'shuffle': True,
-})
-print(config)
+c = MyConfig({
+    'device': 'cuda:3',
+    'size': 'small',
+    'use_fp16': False,
+    'smooth_label': False,
+    'sort_sample': False,
+    'shuffle': False,
+    # cache the data under it
+    'cache_dir': Path.home()/"datasets", # ! should be `pathlib.Path` istance
+    # cache checkpoints under checkpoint_dir/electra_pretrain
+    'checkpoint_dir': Path.home()/'checkpoints', # ! should be `pathlib.Path` istance
 
-model_config = ElectraConfig.from_pretrained(f'google/electra-{SIZE}-discriminator')
-hf_tokenizer = ElectraTokenizerFast.from_pretrained(f"google/electra-{SIZE}-generator")
+})
+
+i = ['small', 'base', 'large'].index(c.size)
+c.mask_prob = [0.15, 0.15, 0.25][i]
+c.lr = [5e-4, 2e-4, 2e-4][i]
+c.bs = [128, 256, 2048][i]
+c.steps = [10**6, 766*1000, 400*1000][i]
+c.max_length = [128, 512, 512][i]
+c.cache_dir.mkdir(exist_ok=True,parents=True)
+c.checkpoint_dir.mkdir(exist_ok=True)
+model_config = ElectraConfig.from_pretrained(f'google/electra-{c.size}-discriminator')
+hf_tokenizer = ElectraTokenizerFast.from_pretrained(f"google/electra-{c.size}-generator")
+if c.size in ['small', 'base']:
+  wiki_cache_dir = c.cache_dir/"wikipedia/20200501.en/1.0.0"
+  book_cache_dir = c.cache_dir/"bookcorpus/plain_text/1.0.0"
+  wbdl_cache_dir = c.cache_dir/"wikibook_dl"
+  wbdl_cache_dir.mkdir(exist_ok=True)
+print(c)
 
 # %% [markdown]
 # # 1. Load Data
 
 # %%
-cache_dir=Path.home()/"datasets"
-cache_dir.mkdir(exist_ok=True)
-if SIZE in ['small', 'base']:
-  wiki_cache_dir = cache_dir/"wikipedia/20200501.en/1.0.0"
-  book_cache_dir = cache_dir/"bookcorpus/plain_text/1.0.0"
-  wbdl_cache_dir = cache_dir/"wikibook_dl"
-  wbdl_cache_dir.mkdir(exist_ok=True)
-max_length = config['max_length']
-
-
-# %%
-if not cache_dir.exists():
-  print('create cache direcotry')
-  cache_dir.mkdir(parents=True) # create all parents needed
-
-if SIZE in ['small', 'base']:
+if c.size in ['small', 'base']:
   
   # wiki
-  if (wiki_cache_dir/f"wiki_electra_{max_length}.arrow").exists():
+  if (wiki_cache_dir/f"wiki_electra_{c.max_length}.arrow").exists():
     print('loading the electra data (wiki)')
-    wiki = nlp.Dataset.from_file(str(wiki_cache_dir/f"wiki_electra_{max_length}.arrow"))
+    wiki = nlp.Dataset.from_file(str(wiki_cache_dir/f"wiki_electra_{c.max_length}.arrow"))
   else:
     print('load/download wiki dataset')
-    wiki = nlp.load_dataset('wikipedia', '20200501.en', cache_dir=cache_dir)['train']
-  
-    print('load/make tokenized wiki dataset')
-    wiki = HF_TokenizeTfm(wiki, cols={'text':'tokids'}, hf_tokenizer=hf_tokenizer, remove_original=True).map(cache_file_name=str(wiki_cache_dir/'wiki_tokenized.arrow'))
+    wiki = nlp.load_dataset('wikipedia', '20200501.en', cache_dir=c.cache_dir)['train']
   
     print('creat data from wiki dataset for ELECTRA')
-    wiki = ELECTRADataTransform(wiki, in_col='tokids', out_col='inpput_ids', max_length=max_length, cls_idx=hf_tokenizer.cls_token_id, sep_idx=hf_tokenizer.sep_token_id).map(cache_file_name=str(wiki_cache_dir/f"wiki_electra_{max_length}.arrow"))
+    wiki = ELECTRADataTransform(wiki, is_docs=True, text_col={'text':'input_ids'}, max_length=c.max_length, hf_toker=hf_tokenizer).map(cache_file_name=str(wiki_cache_dir/f"wiki_electra_{c.max_length}.arrow"))
 
   # bookcorpus
-  if (book_cache_dir/f"book_electra_{max_length}.arrow").exists():
+  if (book_cache_dir/f"book_electra_{c.max_length}.arrow").exists():
     print('loading the electra data (BookCorpus)')
-    book = nlp.Dataset.from_file(str(book_cache_dir/f"book_electra_{max_length}.arrow"))
+    book = nlp.Dataset.from_file(str(book_cache_dir/f"book_electra_{c.max_length}.arrow"))
   else:
     print('load/download BookCorpus dataset')
-    book = nlp.load_dataset('/home/yisiang/nlp/datasets/bookcorpus/bookcorpus.py', cache_dir=cache_dir)['train']
- 
-    print('load/make tokenized BookCorpus dataset')
-    book = HF_TokenizeTfm(book, cols={'text':'tokids'}, hf_tokenizer=hf_tokenizer, remove_original=True).map(cache_file_name=str(book_cache_dir/'book_tokenized.arrow'))
+    book = nlp.load_dataset('bookcorpus', cache_dir=c.cache_dir)['train']
   
     print('creat data from BookCorpus dataset for ELECTRA')
-    book = ELECTRADataTransform(book, in_col='tokids', out_col='inpput_ids', max_length=max_length, cls_idx=hf_tokenizer.cls_token_id, sep_idx=hf_tokenizer.sep_token_id).map(cache_file_name=str(book_cache_dir/f"book_electra_{max_length}.arrow"))
+    book = ELECTRADataTransform(book, is_docs=False, text_col={'text':'input_ids'}, max_length=c.max_length, hf_toker=hf_tokenizer).map(cache_file_name=str(book_cache_dir/f"book_electra_{c.max_length}.arrow"))
 
   wb_data = HF_MergedDataset(wiki, book)
-  wb_dsets = HF_Datasets({'train': wb_data}, cols=['inpput_ids'], hf_toker=hf_tokenizer)
-  dls = wb_dsets.dataloaders(bs=config['bs'],pad_idx=hf_tokenizer.pad_token_id, 
-                             shuffle_train=config['shuffle'], drop_last=False, 
-                             srtkey_fc=None if config['sort_sample'] else False, 
+  wb_dsets = HF_Datasets({'train': wb_data}, cols=['input_ids'], hf_toker=hf_tokenizer)
+  dls = wb_dsets.dataloaders(bs=c.bs, 
+                             shuffle_train=c.shuffle,
+                             srtkey_fc=None if c.sort_sample else False, 
                              cache_dir=Path.home()/'datasets/wikibook_dl', cache_name='dl_{split}.json')
 
 else: # for large size
-  pass
+  raise NotImplementedError
 
 # %% [markdown]
 # # 2. Masked language model objective
@@ -138,13 +128,13 @@ def mask_tokens(inputs, mask_token_index, vocab_size, special_token_indices, mlm
   inputs[replace_token_mask] = random_words[replace_token_mask]
 
   # The rest of the time (10% of the time) we keep the masked input tokens unchanged
-  return inputs, labels, ~mlm_mask
+  return inputs, labels, mlm_mask
 
 class MaskedLMCallback(Callback):
   @delegates(mask_tokens)
-  def __init__(self, mask_tok_id, special_tok_ids, vocab_size, ignore_index=-100, output_ignore_mask=False, **kwargs):
+  def __init__(self, mask_tok_id, special_tok_ids, vocab_size, ignore_index=-100, for_electra=False, **kwargs):
     self.ignore_index = ignore_index
-    self.output_ignore_mask = output_ignore_mask
+    self.for_electra = for_electra
     self.mask_tokens = partial(mask_tokens,
                                mask_token_index=mask_tok_id,
                                special_token_indices=special_tok_ids,
@@ -154,40 +144,42 @@ class MaskedLMCallback(Callback):
 
   def begin_batch(self):
     text_indices = self.xb[0]
-    masked_inputs, labels, ignored = self.mask_tokens(text_indices)
-    if self.output_ignore_mask:
-      self.learn.xb, self.learn.yb = (masked_inputs, ignored), (labels,)
+    masked_inputs, labels, is_mlm_applied = self.mask_tokens(text_indices)
+    if self.for_electra:
+      self.learn.xb, self.learn.yb = (masked_inputs, is_mlm_applied, labels), (labels,)
     else:
       self.learn.xb, self.learn.yb = (masked_inputs,), (labels,)
 
-  def mask(self, tokids):
-    # a function could be used w/o learner
-    return self.mask_tokens(tokids)
-
   @delegates(TfmdDL.show_batch)
-  def show_batch(self, dl, verbose=True, show_ignore_idx=None, **kwargs):
+  def show_batch(self, dl, idx_show_ignored, verbose=True, **kwargs):
     b = dl.one_batch()
-    masked_inputs, labels, ignored = self.mask_tokens(b[0])
-    if show_ignore_idx:
-      labels[labels==self.ignore_index] = show_ignore_idx
+    inputs = b[0]
+    masked_inputs, labels, is_mlm_applied = self.mask_tokens(inputs.clone())
+    # check
+    assert torch.equal(is_mlm_applied, labels!=self.ignore_index)
+    assert torch.equal((~is_mlm_applied *masked_inputs + is_mlm_applied * labels), inputs)
+    # change symbol to show the ignored position
+    labels[labels==self.ignore_index] = idx_show_ignored
+    # some notice to help understand the masking mechanism
     if verbose: 
       print("We won't count loss from position where y is ignore index")
       print("Notice 1. Positions have label token in y will be either [Mask]/other token/orginal token in x")
       print("Notice 2. Special tokens (CLS, SEP) won't be masked.")
       print("Notice 3. Dynamic masking: every time you run gives you different results.")
-    dl.show_batch(b=(masked_inputs, labels), **kwargs)
+    # show
+    tfm_b =(masked_inputs, is_mlm_applied, labels, labels) if self.for_electra else (masked_inputs, labels)   
+    dl.show_batch(b=tfm_b, **kwargs)
 
 
 # %%
 mlm_cb = MaskedLMCallback(mask_tok_id=hf_tokenizer.mask_token_id, 
                           special_tok_ids=hf_tokenizer.all_special_ids, 
                           vocab_size=hf_tokenizer.vocab_size,
-                          mlm_probability=config['mask_prob'],
-                          output_ignore_mask=True)
+                          mlm_probability=c.mask_prob,
+                          for_electra=True)
 
 # %% [markdown]
 # # 3. ELECTRA (replaced token detection objective)
-# 
 # see details in paper [ELECTRA: Pre-training Text Encoders as Discriminators Rather Than Generators](https://arxiv.org/abs/2003.10555)
 
 # %%
@@ -197,24 +189,40 @@ class ELECTRAModel(nn.Module):
     super().__init__()
     self.generator, self.discriminator = generator,discriminator
     self.pad_idx = pad_idx
+    self.gumbel_dist = torch.distributions.gumbel.Gumbel(0.,1.)
+    self.toker = hf_tokenizer
 
-  def forward(self, masked_inp_ids, ignored):
+  def to(self, *args, **kwargs):
+    super().to(*args, **kwargs)
+    a_tensor = next(self.parameters())
+    device, dtype = a_tensor.device, a_tensor.dtype
+    self.gumbel_dist = torch.distributions.gumbel.Gumbel(torch.tensor(0., device=device, dtype=dtype), torch.tensor(1., device=device, dtype=dtype))
+
+  def forward(self, masked_inputs, is_mlm_applied, labels):
     # masked_inp_ids: (B,L)
     # ignored: (B,L)
-
-    non_pad = masked_inp_ids != self.pad_idx
-    gen_logits = self.generator(masked_inp_ids) # (B, L, vocab size)
-
-    # tokens output by generator
-    pred_toks = gen_logits.argmax(dim=-1) # (B, L)
-    # use predicted token to fill 15%(mlm prob) positions
-    generated = ignored * masked_inp_ids + ~ignored * pred_toks # (B,L)
-    # is masked token and not equal to predicted
-    is_replaced = (generated != masked_inp_ids) # (B, L)
     
+    non_pad = masked_inputs != self.pad_idx
+    gen_logits = self.generator(masked_inputs) # (B, L, vocab size)
+
+    # add gumbel noise and then softmax
+    gen_probs = self.gumbel_softmax(gen_logits) # (B, L, vocab size)
+    # tokens output by generator
+    pred_toks = gen_probs.argmax(dim=-1) # (B, L)
+    # use predicted token to fill 15%(mlm prob) mlm applied positions
+    generated = ~is_mlm_applied * masked_inputs + is_mlm_applied * pred_toks # (B,L)
+    # not equal to generator predicted and is at mlm applied position
+    is_replaced = (pred_toks != labels) * is_mlm_applied # (B, L)
+
     disc_logits = self.discriminator(generated) # (B, L)
 
     return gen_logits, disc_logits, is_replaced, non_pad
+
+  def gumbel_softmax(self, logits):
+    "reimplement it cuz there is a bug in torch.nn.functional.gumbel_softmax when fp16 (https://github.com/pytorch/pytorch/issues/41663)"
+    "This is equal to the code of official ELECTRA repo. standard gumbel dist. = -ln(-ln(standard uniform dist.))"
+    gumbel_noise = self.gumbel_dist.sample(logits.shape)
+    return F.softmax(logits + gumbel_noise, dim=-1)
 
 class ELECTRALoss():
   def __init__(self, pad_idx, loss_weights=(1.0, 50.0), label_smooth=False):
@@ -227,8 +235,8 @@ class ELECTRALoss():
     gen_logits, disc_logits, is_replaced = [t.to(dtype=torch.float) for t in pred[:-1]]
     non_pad = pred[-1]
     gen_loss = self.gen_loss_fc(gen_logits, targ_ids) # ignore position where targ_id==-100
-    disc_logits = disc_logits.masked_select(non_pad) # 1d tensor
-    is_replaced = is_replaced.masked_select(non_pad) # 1d tensor
+    disc_logits = disc_logits.masked_select(non_pad) # -> 1d tensor
+    is_replaced = is_replaced.masked_select(non_pad) # -> 1d tensor
     disc_loss = self.disc_loss_fc(disc_logits, is_replaced)
     return gen_loss * self.loss_weights[0] + disc_loss * self.loss_weights[1]
 
@@ -261,19 +269,16 @@ def linear_warmup_and_decay(pct_now, lr_max, end_lr, decay_power, total_steps,wa
 
 # %%
 lr_shedule = ParamScheduler({'lr': partial(linear_warmup_and_decay,
-                                            lr_max=config['lr'],
+                                            lr_max=c.lr,
                                             end_lr=0.0,
                                             decay_power=1,
                                             warmup_steps=10000,
-                                            total_steps=config['steps'])})
+                                            total_steps=c.steps)})
 
 # %% [markdown]
 # # 5. Train
 
 # %%
-cb_dir=Path.home()/'checkpoints'
-cb_dir.mkdir(exist_ok=True)
-
 def now_time():
   now_time = datetime.now(timezone(timedelta(hours=+8)))
   name = str(now_time)[6:-13].replace(' ', '_').replace(':', '-')
@@ -283,22 +288,23 @@ def now_time():
 # %%
 electra_model = ELECTRAModel(HF_Model(ElectraForMaskedLM, model_config, hf_tokenizer,variable_sep=True), 
                              HF_Model(ElectraForPreTraining, model_config, hf_tokenizer,variable_sep=True),
-                             hf_tokenizer.mask_token_id,)
-electra_loss_func = ELECTRALoss(pad_idx=hf_tokenizer.pad_token_id, label_smooth=config['smooth_label']) # label smooth applied only on loss of generator
+                             hf_tokenizer.pad_token_id,)
+electra_loss_func = ELECTRALoss(pad_idx=hf_tokenizer.pad_token_id, label_smooth=c.smooth_label) # label smooth applied only on loss of generator
 
-dls.to(torch.device('cuda:2'))
+dls.to(torch.device(c.device))
 run_name = now_time()
 print(run_name)
 learn = Learner(dls, electra_model,
                 loss_func=electra_loss_func,
                 opt_func=partial(Adam, eps=1e-6,),
-                path=str(cb_dir),
+                path=str(c.checkpoint_dir),
                 model_dir='electra_pretrain',
                 cbs=[mlm_cb,
-                    RunSteps(config['steps'], [0.5, 1.0], run_name+"_{percent}"),
-                    ]
+                    RunSteps(c.steps, [0.0625, 0.125, 0.5, 1.0], run_name+"_{percent}"),
+                    ],
                 )
-if config['use_fp16']: learn = learn.to_fp16()
+if c.use_fp16: learn = learn.to_fp16()
 learn.fit(9999, cbs=[lr_shedule])
 learn.save(run_name)
+
 

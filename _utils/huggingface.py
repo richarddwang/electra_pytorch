@@ -115,9 +115,9 @@ class MyShowTitle:
     "Base class that adds a simple `show`"
     
     @classmethod
-    def init(cls, data, **kwargs):
+    def init(cls, data, title=None, **kwargs):
         item = cls(data)
-        item._show_args = kwargs
+        item._show_args = {'title': title if title else item.default_title, **kwargs}
         return item
 
     def show(self, ctx=None, **kwargs):
@@ -126,33 +126,37 @@ class MyShowTitle:
 
 # it seems that python prioritising prior inherited class when finding methods   
 
-class MyTitledInt(MyShowTitle, Int): pass
+class MyTitledInt(MyShowTitle, Int): default_title = 'int'
 
-class MyTitledFloat(MyShowTitle, Float): pass
+class MyTitledFloat(MyShowTitle, Float): default_title = 'float'
 
 # I created it
 class MyTitledBool(MyShowTitle, Int): # python says bool can't be base class
+    default_title = 'bool'
     def show(self, ctx=None, **kwargs):
         "Show self"
         return my_show_title(str(bool(self)), ctx=ctx, **merge(self._show_args, kwargs))
 
 class MyTitledStr(MyShowTitle, Str):
-  def truncate(self, n):
-    "Truncate self to `n`"
-    words = self.split(' ')[:n]
-    return MyTitledStr.init(' '.join(words), **self._show_args)
+    default_title = 'text'
+    def truncate(self, n):
+        "Truncate self to `n`"
+        words = self.split(' ')[:n]
+        return MyTitledStr.init(' '.join(words), **self._show_args)
 
-class MyTitledTuple(MyShowTitle, Tuple): pass
+class MyTitledTuple(MyShowTitle, Tuple): default_title = 'list'
 
-class MyCategory(MyShowTitle, Str): pass
+class MyCategory(MyShowTitle, Str): default_title = 'label'
 
 class MyMultiCategory(MyShowTitle, L):
+    default_title = 'labels'
     def show(self, ctx=None, sep=';', color='black', **kwargs):
         return my_show_title(sep.join(self.map(str)), ctx=ctx, color=color, **merge(self._show_args, kwargs))
 
 """ Caution !!
-This function is inperfect.
-This will be a problem when you are doing non-text problem with n_inp > 1 (multiple input column),
+These two function is inperfect.
+But they cope with mutiple input columns problem (n_inp >1), which cause no df printing but just sequentail print
+These will be a problem when you are doing non-text problem with n_inp > 1 (multiple input column),
 which shouldn't be the case of huggingface/nlp user.
 And I hope fastai come up with a good solution to show_batch multiple inputs problems for text/non-text.
 """
@@ -160,6 +164,13 @@ And I hope fastai come up with a good solution to show_batch multiple inputs pro
 def show_batch(x:tuple, y, samples, ctxs=None, max_n=9, **kwargs):
   if ctxs is None: ctxs = get_empty_df(min(len(samples), max_n))
   ctxs = show_batch[object](x, y, samples, max_n=max_n, ctxs=ctxs, **kwargs)
+  display_df(pd.DataFrame(ctxs))
+  return ctxs
+
+@typedispatch
+def show_results(x: tuple, y, samples, outs, ctxs=None, max_n=10, trunc_at=150, **kwargs):
+  if ctxs is None: ctxs = get_empty_df(min(len(samples), max_n))
+  ctxs = show_results[object](x, y, samples, outs, ctxs=ctxs, max_n=max_n, **kwargs)
   display_df(pd.DataFrame(ctxs))
   return ctxs
 
@@ -212,33 +223,33 @@ class HF_Dataset():
     if len(self.col_names) != len(o): return tuple( self._decode(o_) for o_ in o )
     return tuple( self._decode(o_, self.col_names[i]) for i, o_ in enumerate(o) )
 
-  def _decode_title(self, d, title_cls, title): 
+  def _decode_title(self, d, title_cls, title=None): 
     if title: return title_cls.init(d, title=title)
     else: return title_cls.init(d)
 
   @typedispatch
-  def _decode(self, t:torch.Tensor, title):
-    if t.shape: title_cls = MyTitledTuple
-    elif isinstance(t.item(),bool): title_cls = MyTitledBool # bool is also int, so check whether is bool first
+  def _decode(self, t:torch.Tensor, title=None):
+    if t.shape: title_cls, default_title = MyTitledTuple, 'list'
+    elif isinstance(t.item(),bool): title_cls, default_title = MyTitledBool, 'list' # bool is also int, so check whether is bool first
     elif isinstance(t.item(),float): title_cls = MyTitledFloat
     elif isinstance(t.item(),int): title_cls = MyTitledInt
     return self._decode_title(t.tolist(), title_cls , title)
 
   @typedispatch
-  def _decode(self, t:TensorText, title): 
+  def _decode(self, t:TensorText, title='text'): 
     assert self.hf_toker, "You should give a huggingface tokenizer if you want to show batch."
     if self.neat_show: text = self.hf_toker.decode([idx for idx in t if idx != self.hf_toker.pad_token_id])
     else: text = ' '.join(self.hf_toker.convert_ids_to_tokens(t))
     return self._decode_title(text, MyTitledStr, title)
 
   @typedispatch
-  def _decode(self, t:LMTensorText, title): return self._decode[TensorText](self, t, title)
+  def _decode(self, t:LMTensorText, title='text'): return self._decode[TensorText](self, t, title)
 
   @typedispatch
-  def _decode(self, t:TensorCategory, title): return self._decode_title(t.item(), MyCategory, title)
+  def _decode(self, t:TensorCategory, title='label'): return self._decode_title(t.item(), MyCategory, title)
 
   @typedispatch
-  def _decode(self, t:TensorMultiCategory, title): return self._decode_title(t.tolist(), MyMultiCategory, title)
+  def _decode(self, t:TensorMultiCategory, title='labels'): return self._decode_title(t.tolist(), MyMultiCategory, title)
 
   def __getattr__(self, name):
     "If not defined, let the nlp.Dataset in it act for us."
@@ -435,7 +446,7 @@ class HF_TokenizeTfm(HF_BaseTransform):
     state['tokenizer'] = None 
     return state
 
-class AggregateTransform(HF_BaseTransform):
+class CombineTransform(HF_BaseTransform):
   """
   Inherit this class and implement `accumulate` and `create_example`
   """
@@ -473,7 +484,8 @@ class AggregateTransform(HF_BaseTransform):
     
     # whehther put last example when it is last batch of `map`
     if not self.drop_last and self.last_idx in indices: 
-      self.commit_example(self.create_example())
+      try: self.commit_example(self.create_example())
+      except: pass # assume it is because there is nothing to create a example
 
     return self.new_b
 
@@ -519,8 +531,8 @@ class AggregateTransform(HF_BaseTransform):
     return pa.Table.from_pydict(test_output).schema
     
 
-@delegates(AggregateTransform, but=["inp_cols", "out_cols", "init_attrs"])
-class LMTransform(AggregateTransform):
+@delegates(CombineTransform, but=["inp_cols", "out_cols", "init_attrs"])
+class LMTransform(CombineTransform):
   def __init__(self, tokenized_hf_dset, max_len, text_col, x_text_col='x_text', y_text_col='y_text', **kwargs):
     if isinstance(text_col, str): text_col = {text_col:['x_text','y_text']}
     assert isinstance(text_col, dict)
@@ -555,28 +567,41 @@ class LMTransform(AggregateTransform):
 
     return example
 
-@delegates(AggregateTransform, but=["inp_cols", "out_cols", "init_attrs"])
-class ELECTRADataTransform(AggregateTransform):
+@delegates(CombineTransform, but=["inp_cols", "out_cols", "init_attrs"])
+class ELECTRADataTransform(CombineTransform):
   
-  def __init__(self, tokenized_hf_dset, text_col, max_length, cls_idx, sep_idx, **kwargs):
+  def __init__(self, hf_dset, is_docs, text_col, max_length, hf_toker, delimiter='\n', **kwargs):
     if isinstance(text_col, str): text_col={text_col:text_col}
     assert isinstance(text_col, dict)
+    self.is_docs = is_docs
     self.in_col, self.out_col = next(iter(text_col.items()))
     self._current_sentences = []
     self._current_length = 0
     self._max_length = max_length
     self._target_length = max_length
-    self.cls_idx, self.sep_idx = cls_idx, sep_idx
-    super().__init__(tokenized_hf_dset, inp_cols=[self.in_col], out_cols=[self.out_col], 
+    self.cls_idx, self.sep_idx = hf_toker.cls_token_id, hf_toker.sep_token_id
+    self.hf_toker = hf_toker
+    self.delimiter = delimiter
+    super().__init__(hf_dset, inp_cols=[self.in_col], out_cols=[self.out_col], 
                     init_attrs=['_current_sentences', '_current_length', '_target_length'], **kwargs)
 
-  # two functions required by AggregateTransform
-  def accumulate(self, tokids):
-    self.add_line(tokids)
+  """
+  This two main functions adapts official source code creates pretraining dataset, to CombineTransform
+  """
+  def accumulate(self, text):
+    sentences = text.split(self.delimiter)
+    for sentence in sentences:
+      if not sentence: continue # skip empty
+      tokids = self.hf_toker.convert_tokens_to_ids(self.hf_toker.tokenize(sentence))
+      self.add_line(tokids)
+    # end of doc
+    if self.is_docs and self._current_length > 0:
+      self.commit_example(self.create_example())
   
   def create_example(self):
-    input_ids = self._create_example()
+    input_ids = self._create_example() # this line reset _current_sentences and _current_length in the end
     return {self.out_col: input_ids}
+  # ...................................................
 
   def add_line(self, tokids):
     """Adds a line of text to the current example being built."""
@@ -632,14 +657,20 @@ class ELECTRADataTransform(AggregateTransform):
       input_ids += second_segment + [self.sep_idx]
     return input_ids
 
+  def __getstate__(self):
+    "specify something you don't want pickle here, remember to use copy to not modfiy orginal instance"
+    state = self.__dict__.copy() 
+    state['hf_toker'] = None 
+    return state
+
 # To just take hidden features output
 class HF_Model(nn.Module):
   "A wrapper for model of HuggingFace/Transformers for using them with single input/output."
-  def __init__(self, hf_cls, config_or_name, hf_toker=None, pad_id=None, sep_id=None, variable_sep=False):
+  def __init__(self, hf_cls_or_model, config_or_name=None, hf_toker=None, pad_id=None, sep_id=None, variable_sep=False):
     """
     Args:
-      `hf_cls`: model class of HuggingFace/Transformers.
-      `config_or_name`: a `config` instance or pretrained checkpoint name of HuggingFace/Transformers
+      `hf_cls_or_model`: model class or instance of HuggingFace/Transformers, that required attention_mask and token_type_ids as input and output a tuple.
+      `config_or_name`: a `config` instance or pretrained checkpoint name of HuggingFace/Transformers. If `None`, implies `hf_cls_or_model` is model instance.
       `hf_toker`: Used to infer `pad_id` and `spe_id`
       `pad_id`: To automatically infer attention mask. If not passed, use `hf_toker.pad_token_id`
       `sep_id`: To automatically infer token_type. If not passed, use `hf_toker.sep_token_id`
@@ -647,8 +678,9 @@ class HF_Model(nn.Module):
     """
     "pass sep token id if sentence A sentence B setting. (default is sentence A setting)"
     super().__init__()
-    if isinstance(config_or_name, str): self.model = hf_cls.from_pretrained(config_or_name)
-    else: self.model = hf_cls(config_or_name)
+    if isinstance(config_or_name, str): self.model = hf_cls_or_model.from_pretrained(config_or_name)
+    elif config_or_name is None: self.model = hf_cls_or_model
+    else: self.model = hf_cls_or_model(config_or_name)
     self.pad_id = pad_id if pad_id else hf_toker.pad_token_id
     self.sep_id = sep_id if sep_id else hf_toker.sep_token_id
     self.variable_sep = variable_sep
