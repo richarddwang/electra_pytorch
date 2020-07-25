@@ -5,7 +5,6 @@ from pathlib import Path
 from functools import partial
 from datetime import datetime, timezone, timedelta
 from IPython.core.debugger import set_trace as bk
-import pandas as pd
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -21,9 +20,9 @@ from _utils.utils import *
 
 # %%
 c = MyConfig({
-    'device': 'cuda:3',
+    'device': 'cuda:0',
     'size': 'small',
-    'use_fp16': False,
+    'use_fp16': True,
     'smooth_label': False,
     'sort_sample': False,
     'shuffle': False,
@@ -202,21 +201,18 @@ class ELECTRAModel(nn.Module):
     # masked_inp_ids: (B,L)
     # ignored: (B,L)
     
-    non_pad = masked_inputs != self.pad_idx
     gen_logits = self.generator(masked_inputs) # (B, L, vocab size)
 
-    # add gumbel noise and then softmax
-    gen_probs = self.gumbel_softmax(gen_logits) # (B, L, vocab size)
-    # tokens output by generator
-    pred_toks = gen_probs.argmax(dim=-1) # (B, L)
+    # add gumbel noise and then sample
+    pred_toks = (gen_logits + self.gumbel_dist.sample(gen_logits.shape)).argmax(dim=-1)
     # use predicted token to fill 15%(mlm prob) mlm applied positions
     generated = ~is_mlm_applied * masked_inputs + is_mlm_applied * pred_toks # (B,L)
     # not equal to generator predicted and is at mlm applied position
     is_replaced = (pred_toks != labels) * is_mlm_applied # (B, L)
 
     disc_logits = self.discriminator(generated) # (B, L)
-
-    return gen_logits, disc_logits, is_replaced, non_pad
+    bk()
+    return gen_logits, generated, disc_logits, is_replaced
 
   def gumbel_softmax(self, logits):
     "reimplement it cuz there is a bug in torch.nn.functional.gumbel_softmax when fp16 (https://github.com/pytorch/pytorch/issues/41663)"
@@ -232,13 +228,19 @@ class ELECTRALoss():
     self.disc_loss_fc = nn.BCEWithLogitsLoss()
     
   def __call__(self, pred, targ_ids):
-    gen_logits, disc_logits, is_replaced = [t.to(dtype=torch.float) for t in pred[:-1]]
-    non_pad = pred[-1]
-    gen_loss = self.gen_loss_fc(gen_logits, targ_ids) # ignore position where targ_id==-100
+    gen_logits, generated, disc_logits, is_replaced = pred
+    gen_loss = self.gen_loss_fc(gen_logits.float(), targ_ids) # ignore position where targ_id==-100
+    non_pad = generated != self.pad_idx
     disc_logits = disc_logits.masked_select(non_pad) # -> 1d tensor
     is_replaced = is_replaced.masked_select(non_pad) # -> 1d tensor
-    disc_loss = self.disc_loss_fc(disc_logits, is_replaced)
+    disc_loss = self.disc_loss_fc(disc_logits.float(), is_replaced.float())
     return gen_loss * self.loss_weights[0] + disc_loss * self.loss_weights[1]
+
+  def decodes(self, pred):
+    gen_logits, generated, disc_logits, is_replaced = pred
+    gen_pred = gen_logits.argmax(dim=-1)
+    disc_pred = disc_logits > 0
+    return gen_pred, generated, disc_pred, is_replaced
 
 # %% [markdown]
 # # 4. Learning rate schedule
@@ -300,11 +302,12 @@ learn = Learner(dls, electra_model,
                 path=str(c.checkpoint_dir),
                 model_dir='electra_pretrain',
                 cbs=[mlm_cb,
-                    RunSteps(c.steps, [0.0625, 0.125, 0.5, 1.0], run_name+"_{percent}"),
+                    #RunSteps(c.steps, [0.0625, 0.125, 0.5, 1.0], run_name+"_{percent}"),
+                    RunSteps(10),
                     ],
                 )
 if c.use_fp16: learn = learn.to_fp16()
+learn.load('7-23_10-33-41_12.5%')
 learn.fit(9999, cbs=[lr_shedule])
-learn.save(run_name)
 
 
