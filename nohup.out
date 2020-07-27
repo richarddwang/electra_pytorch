@@ -1,10 +1,0 @@
-Traceback (most recent call last):
-  File "pretrain.py", line 7, in <module>
-    from IPython.core.debugger import set_trace as bk
-ModuleNotFoundError: No module named 'IPython'
-{'device': 'cuda:3', 'size': 'small', 'use_fp16': False, 'smooth_label': False, 'sort_sample': False, 'shuffle': False, 'cache_dir': Path('/home/yisiang/datasets'), 'checkpoint_dir': Path('/home/yisiang/checkpoints'), 'mask_prob': 0.15, 'lr': 0.0005, 'bs': 128, 'steps': 1000000, 'max_length': 128}
-loading the electra data (wiki)
-loading the electra data (BookCorpus)
-7-23_10-33-41
-█epoch     train_loss  valid_loss  time    
-█

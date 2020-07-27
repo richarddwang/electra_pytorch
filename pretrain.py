@@ -2,12 +2,14 @@
 # To add a new markdown cell, type '# %% [markdown]'
 # %%
 from pathlib import Path
+import os
 from functools import partial
 from datetime import datetime, timezone, timedelta
 from IPython.core.debugger import set_trace as bk
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torch.utils.data as D
 import nlp
 from transformers import ElectraModel, ElectraConfig, ElectraTokenizerFast, ElectraForMaskedLM,ElectraForPreTraining
 from fastai2.text.all import *
@@ -20,17 +22,20 @@ from _utils.utils import *
 
 # %%
 c = MyConfig({
-    'device': 'cuda:0',
+    'device': 'cuda:1',
     'size': 'small',
     'use_fp16': True,
-    'smooth_label': False,
-    'sort_sample': False,
-    'shuffle': False,
+    'gen_smooth_label': False,
+    'disc_smooth_label': False,
+    'balanced_label': False,
+    'tfdata': True,
+    'sort_sample': True,
+    'shuffle': True,
+    'percent': False,
     # cache the data under it
     'cache_dir': Path.home()/"datasets", # ! should be `pathlib.Path` istance
     # cache checkpoints under checkpoint_dir/electra_pretrain
     'checkpoint_dir': Path.home()/'checkpoints', # ! should be `pathlib.Path` istance
-
 })
 
 i = ['small', 'base', 'large'].index(c.size)
@@ -41,20 +46,22 @@ c.steps = [10**6, 766*1000, 400*1000][i]
 c.max_length = [128, 512, 512][i]
 c.cache_dir.mkdir(exist_ok=True,parents=True)
 c.checkpoint_dir.mkdir(exist_ok=True)
-model_config = ElectraConfig.from_pretrained(f'google/electra-{c.size}-discriminator')
+gen_config = ElectraConfig.from_pretrained(f'google/electra-{c.size}-generator')
+disc_config = ElectraConfig.from_pretrained(f'google/electra-{c.size}-discriminator')
 hf_tokenizer = ElectraTokenizerFast.from_pretrained(f"google/electra-{c.size}-generator")
 if c.size in ['small', 'base']:
   wiki_cache_dir = c.cache_dir/"wikipedia/20200501.en/1.0.0"
   book_cache_dir = c.cache_dir/"bookcorpus/plain_text/1.0.0"
   wbdl_cache_dir = c.cache_dir/"wikibook_dl"
   wbdl_cache_dir.mkdir(exist_ok=True)
+print(os.getpid())
 print(c)
 
 # %% [markdown]
 # # 1. Load Data
 
 # %%
-if c.size in ['small', 'base']:
+if c.size in ['small', 'base'] and not c.tfdata:
   
   # wiki
   if (wiki_cache_dir/f"wiki_electra_{c.max_length}.arrow").exists():
@@ -86,7 +93,26 @@ if c.size in ['small', 'base']:
                              cache_dir=Path.home()/'datasets/wikibook_dl', cache_name='dl_{split}.json')
 
 else: # for large size
-  raise NotImplementedError
+  #raise NotImplementedError
+  import tensorflow as tf
+  tf.compat.v1.enable_eager_execution()
+  from electra.configure_pretraining import PretrainingConfig
+  from electra.pretrain.pretrain_data import get_input_fn
+  class TFDataLoader():
+    def __init__(self, batch_size, size, device='cpu'):
+      self.input_func = get_input_fn(PretrainingConfig('eeee', '../electra/data', **{'model_size': size}), True)
+      self.bs = batch_size
+      self.device = device
+      self.n_inp = 1 # for fastai to split x and y
+    def __iter__(self):
+      infinite_data = self.input_func({'batch_size':self.bs})
+      for features in infinite_data:
+        yield (torch.tensor(features['input_ids'].numpy(), dtype=torch.long, device=self.device),)
+    def to(self, device):
+      self.device = device
+      return self
+    def __len__(self): return 62500 # 6.25% of 10**6
+  dls = DataLoaders(TFDataLoader(c.bs, c.size))
 
 # %% [markdown]
 # # 2. Masked language model objective
@@ -211,7 +237,7 @@ class ELECTRAModel(nn.Module):
     is_replaced = (pred_toks != labels) * is_mlm_applied # (B, L)
 
     disc_logits = self.discriminator(generated) # (B, L)
-    bk()
+
     return gen_logits, generated, disc_logits, is_replaced
 
   def gumbel_softmax(self, logits):
@@ -221,18 +247,36 @@ class ELECTRAModel(nn.Module):
     return F.softmax(logits + gumbel_noise, dim=-1)
 
 class ELECTRALoss():
-  def __init__(self, pad_idx, loss_weights=(1.0, 50.0), label_smooth=False):
+  def __init__(self, pad_idx, loss_weights=(1.0, 50.0), gen_label_smooth=False, disc_label_smooth=False):
     self.pad_idx = pad_idx
     self.loss_weights = loss_weights
-    self.gen_loss_fc = LabelSmoothingCrossEntropyFlat() if label_smooth else CrossEntropyLossFlat()
+    if gen_label_smooth:
+      eps = gen_label_smooth if isinstance(gen_label_smooth, float) else 0.1
+      self.gen_loss_fc = LabelSmoothingCrossEntropyFlat(eps=eps)
+    else:
+      self.gen_loss_fc = CrossEntropyLossFlat()
     self.disc_loss_fc = nn.BCEWithLogitsLoss()
+    self.disc_label_smooth = disc_label_smooth
     
   def __call__(self, pred, targ_ids):
     gen_logits, generated, disc_logits, is_replaced = pred
     gen_loss = self.gen_loss_fc(gen_logits.float(), targ_ids) # ignore position where targ_id==-100
-    non_pad = generated != self.pad_idx
-    disc_logits = disc_logits.masked_select(non_pad) # -> 1d tensor
-    is_replaced = is_replaced.masked_select(non_pad) # -> 1d tensor
+    if c.balanced_label:
+      non_mlm_pos = targ_ids == -100
+      non_pad = generated != self.pad_idx
+      rlm_mask = torch.full(non_pad.shape, c.mask_prob/(1-c.mask_prob), device=non_pad.device)
+      rlm_mask = rlm_mask * non_pad * non_mlm_pos
+      rlm_mask = (torch.bernoulli(rlm_mask).bool() + ~non_mlm_pos).bool()
+      disc_logits = disc_logits.masked_select(rlm_mask) # -> 1d tensor
+      is_replaced = is_replaced.masked_select(rlm_mask) # -> 1d tensor
+    else:
+      non_pad = generated != self.pad_idx
+      disc_logits = disc_logits.masked_select(non_pad) # -> 1d tensor
+      is_replaced = is_replaced.masked_select(non_pad) # -> 1d tensor
+    if self.disc_label_smooth:
+      eps = self.disc_label_smooth if isinstance(self.disc_label_smooth, float) else 0.1
+      zeros = ~is_replaced
+      is_replaced = is_replaced.float().masked_fill(zeros, eps)
     disc_loss = self.disc_loss_fc(disc_logits.float(), is_replaced.float())
     return gen_loss * self.loss_weights[0] + disc_loss * self.loss_weights[1]
 
@@ -274,8 +318,8 @@ lr_shedule = ParamScheduler({'lr': partial(linear_warmup_and_decay,
                                             lr_max=c.lr,
                                             end_lr=0.0,
                                             decay_power=1,
-                                            warmup_steps=10000,
-                                            total_steps=c.steps)})
+                                            warmup_steps=10000 if not c.percent else int(0.1 * c.percent * 10**6),
+                                            total_steps=c.steps if not c.percent else int(c.percent * c.steps))})
 
 # %% [markdown]
 # # 5. Train
@@ -288,10 +332,10 @@ def now_time():
 
 
 # %%
-electra_model = ELECTRAModel(HF_Model(ElectraForMaskedLM, model_config, hf_tokenizer,variable_sep=True), 
-                             HF_Model(ElectraForPreTraining, model_config, hf_tokenizer,variable_sep=True),
+electra_model = ELECTRAModel(HF_Model(ElectraForMaskedLM, gen_config, hf_tokenizer, variable_sep=True), 
+                             HF_Model(ElectraForPreTraining, disc_config, hf_tokenizer, variable_sep=True),
                              hf_tokenizer.pad_token_id,)
-electra_loss_func = ELECTRALoss(pad_idx=hf_tokenizer.pad_token_id, label_smooth=c.smooth_label) # label smooth applied only on loss of generator
+electra_loss_func = ELECTRALoss(pad_idx=hf_tokenizer.pad_token_id, gen_label_smooth=c.gen_smooth_label, disc_label_smooth=c.disc_smooth_label)
 
 dls.to(torch.device(c.device))
 run_name = now_time()
@@ -302,12 +346,11 @@ learn = Learner(dls, electra_model,
                 path=str(c.checkpoint_dir),
                 model_dir='electra_pretrain',
                 cbs=[mlm_cb,
-                    #RunSteps(c.steps, [0.0625, 0.125, 0.5, 1.0], run_name+"_{percent}"),
-                    RunSteps(10),
+                    RunSteps(c.steps, [0.0625, 0.125, 0.5, 1.0], run_name+"_{percent}") if not c.percent else RunSteps(int(c.steps*c.percent)),
                     ],
                 )
 if c.use_fp16: learn = learn.to_fp16()
-learn.load('7-23_10-33-41_12.5%')
 learn.fit(9999, cbs=[lr_shedule])
+if c.percent: learn.save(run_name)
 
 

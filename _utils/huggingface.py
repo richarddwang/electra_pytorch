@@ -687,7 +687,9 @@ class HF_Model(nn.Module):
     
   def forward(self, x):
     attn_mask = x!= self.pad_id
-    return self.model(x, attn_mask, token_type_ids=self._token_type_ids_for(x))[0]
+    token_type_ids = self._token_type_ids_for(x)
+    token_type_ids = token_type_ids * attn_mask
+    return self.model(x, attn_mask, token_type_ids=token_type_ids)[0]
 
   def _token_type_ids_for(self, x):
     "x: (batch size, sequence length)"

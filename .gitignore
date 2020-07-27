@@ -2,3 +2,7 @@
 /wandb/*
 **/__pycache__/
 /.ipynb_checkpoints/*
+*.npy
+*.log
+nohup.out
+/electra/*
