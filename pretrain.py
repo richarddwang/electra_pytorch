@@ -10,6 +10,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.utils.data as D
+import torch.tensor as T
 import nlp
 from transformers import ElectraModel, ElectraConfig, ElectraTokenizerFast, ElectraForMaskedLM,ElectraForPreTraining
 from fastai2.text.all import *
@@ -22,13 +23,18 @@ from _utils.utils import *
 
 # %%
 c = MyConfig({
-    'device': 'cuda:1',
+    'device': 'cuda:2',
     'size': 'small',
     'use_fp16': True,
+    'fp32_gumbel': False,
+    'mask': None,
+    'gumbel': True,
+    'invert_label': False,
     'gen_smooth_label': False,
     'disc_smooth_label': False,
     'balanced_label': False,
-    'tfdata': True,
+    'load_smallplusplus':False,
+    'tfdata': False,
     'sort_sample': True,
     'shuffle': True,
     'percent': False,
@@ -44,10 +50,15 @@ c.lr = [5e-4, 2e-4, 2e-4][i]
 c.bs = [128, 256, 2048][i]
 c.steps = [10**6, 766*1000, 400*1000][i]
 c.max_length = [128, 512, 512][i]
+generator_size_divisor = [4, 3, 4][i]
 c.cache_dir.mkdir(exist_ok=True,parents=True)
 c.checkpoint_dir.mkdir(exist_ok=True)
-gen_config = ElectraConfig.from_pretrained(f'google/electra-{c.size}-generator')
 disc_config = ElectraConfig.from_pretrained(f'google/electra-{c.size}-discriminator')
+gen_config = ElectraConfig.from_pretrained(f'google/electra-{c.size}-generator')
+# note that public electra-small model is actually small++ and don't scale down generator size 
+gen_config.hidden_size = int(disc_config.hidden_size/generator_size_divisor)
+gen_config.num_attention_heads = int(disc_config.num_attention_heads/generator_size_divisor)
+gen_config.intermediate_size = int(disc_config.intermediate_size/generator_size_divisor)
 hf_tokenizer = ElectraTokenizerFast.from_pretrained(f"google/electra-{c.size}-generator")
 if c.size in ['small', 'base']:
   wiki_cache_dir = c.cache_dir/"wikipedia/20200501.en/1.0.0"
@@ -128,13 +139,13 @@ Modified from HuggingFace/transformers (https://github.com/huggingface/transform
 - cost you only 20 ms on a (128,128) tensor, so dynamic masking is cheap   
 """
 # https://github.com/huggingface/transformers/blob/1789c7daf1b8013006b0aef6cb1b8f80573031c5/examples/run_language_modeling.py#L179
-def mask_tokens(inputs, mask_token_index, vocab_size, special_token_indices, mlm_probability=0.15, ignore_index=-100):
+def mask_tokens(inputs, mask_token_index, vocab_size, special_token_indices, mlm_probability=0.15, replace_prob=0.1, orginal_prob=0.1, ignore_index=-100):
   """ Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original. """
   "ignore_index in nn.CrossEntropy is default to -100, so you don't need to specify ignore_index in loss"
   
   device = inputs.device
   labels = inputs.clone()
-  # We sample a few tokens in each sequence for masked-LM training (with probability mlm_probability defaults to 0.15 in Bert/RoBER
+  # We sample a few tokens in each sequence for masked-LM training (with probability mlm_probability defaults to 0.15 in Bert/RoBERTA
   probability_matrix = torch.full(labels.shape, mlm_probability, device=device)
   special_tokens_mask = torch.full(inputs.shape, False, dtype=torch.bool, device=device)
   for sp_id in special_token_indices:
@@ -143,16 +154,19 @@ def mask_tokens(inputs, mask_token_index, vocab_size, special_token_indices, mlm
   mlm_mask = torch.bernoulli(probability_matrix).bool()
   labels[~mlm_mask] = ignore_index  # We only compute loss on masked tokens
 
-  # 80% of the time, we replace masked input tokens with mask_token
+  # <1 - replace_prob - orginal_prob>% of the time, we replace masked input tokens with mask_token
+  mask_prob = 1 - replace_prob - orginal_prob
   mask_token_mask = torch.bernoulli(torch.full(labels.shape, 0.8, device=device)).bool() & mlm_mask
   inputs[mask_token_mask] = mask_token_index
 
-  # 10% of the time, we replace masked input tokens with random word
-  replace_token_mask = torch.bernoulli(torch.full(labels.shape, 0.5, device=device)).bool() & mlm_mask & ~mask_token_mask
-  random_words = torch.randint(vocab_size, labels.shape, dtype=torch.long, device=device)
-  inputs[replace_token_mask] = random_words[replace_token_mask]
+  # <replace_prob>% of the time, we replace masked input tokens with random word
+  if int(replace_prob)!=0:
+    rep_prob = replace_prob/(replace_prob + orginal_prob)
+    replace_token_mask = torch.bernoulli(torch.full(labels.shape, 0.5, device=device)).bool() & mlm_mask & ~mask_token_mask
+    random_words = torch.randint(vocab_size, labels.shape, dtype=torch.long, device=device)
+    inputs[replace_token_mask] = random_words[replace_token_mask]
 
-  # The rest of the time (10% of the time) we keep the masked input tokens unchanged
+  # <orginal_prob>% of the time, we keep the masked input tokens unchanged
   return inputs, labels, mlm_mask
 
 class MaskedLMCallback(Callback):
@@ -197,10 +211,18 @@ class MaskedLMCallback(Callback):
 
 
 # %%
+if c.mask == 'electra':
+  rep_prob, ori_prob = 0.0, 0.15
+elif c.mask == 'mc':
+  rep_prob, ori_prob = 0.0, 0.0
+else:
+  rep_prob, ori_prob = 0.1, 0.1
 mlm_cb = MaskedLMCallback(mask_tok_id=hf_tokenizer.mask_token_id, 
                           special_tok_ids=hf_tokenizer.all_special_ids, 
                           vocab_size=hf_tokenizer.vocab_size,
                           mlm_probability=c.mask_prob,
+                          replace_prob=rep_prob, 
+                          orginal_prob=ori_prob,
                           for_electra=True)
 
 # %% [markdown]
@@ -210,31 +232,47 @@ mlm_cb = MaskedLMCallback(mask_tok_id=hf_tokenizer.mask_token_id,
 # %%
 class ELECTRAModel(nn.Module):
   
-  def __init__(self, generator, discriminator, pad_idx):
+  def __init__(self, generator, discriminator):
     super().__init__()
     self.generator, self.discriminator = generator,discriminator
-    self.pad_idx = pad_idx
     self.gumbel_dist = torch.distributions.gumbel.Gumbel(0.,1.)
     self.toker = hf_tokenizer
+    # tight embeddings (word, pos, token_type)
+    # Note input and output embedding of generator has been tighted by huggingface/transformers 
+    self.discriminator.model.electra.embeddings = self.generator.model.electra.embeddings
 
   def to(self, *args, **kwargs):
     super().to(*args, **kwargs)
     a_tensor = next(self.parameters())
     device, dtype = a_tensor.device, a_tensor.dtype
+    if c.fp32_gumbel: dtype = torch.float32
     self.gumbel_dist = torch.distributions.gumbel.Gumbel(torch.tensor(0., device=device, dtype=dtype), torch.tensor(1., device=device, dtype=dtype))
 
   def forward(self, masked_inputs, is_mlm_applied, labels):
     # masked_inp_ids: (B,L)
     # ignored: (B,L)
+    #assert is_mlm_applied.dtype == torch.bool
     
     gen_logits = self.generator(masked_inputs) # (B, L, vocab size)
-
+    
+    # reduce size
+    mlm_gen_logits = gen_logits[is_mlm_applied, :].detach() # ( #mlm_positions, vocab_size)
     # add gumbel noise and then sample
-    pred_toks = (gen_logits + self.gumbel_dist.sample(gen_logits.shape)).argmax(dim=-1)
+    # will be a bottleneck if sample tensors of such size (128,128,30522) (57 ms on gpu, 7s on cpu)
+    if c.gumbel:
+      if c.fp32_gumbel:
+        pred_toks = (mlm_gen_logits.float() + self.gumbel_dist.sample(mlm_gen_logits.shape)).argmax(dim=-1)
+      else:
+        pred_toks = (mlm_gen_logits + self.gumbel_dist.sample(mlm_gen_logits.shape)).argmax(dim=-1)
+    else:
+      pred_toks = mlm_gen_logits.argmax(dim=-1)
+    # pred_toks: ( #mlm_positions, )
     # use predicted token to fill 15%(mlm prob) mlm applied positions
-    generated = ~is_mlm_applied * masked_inputs + is_mlm_applied * pred_toks # (B,L)
+    generated = masked_inputs.clone() # (B,L)
+    generated[is_mlm_applied] = pred_toks # (B,L)
     # not equal to generator predicted and is at mlm applied position
-    is_replaced = (pred_toks != labels) * is_mlm_applied # (B, L)
+    is_replaced = is_mlm_applied.clone() # (B,L)
+    is_replaced[is_mlm_applied] = (pred_toks != labels[is_mlm_applied]) # (B,L)
 
     disc_logits = self.discriminator(generated) # (B, L)
 
@@ -273,6 +311,8 @@ class ELECTRALoss():
       non_pad = generated != self.pad_idx
       disc_logits = disc_logits.masked_select(non_pad) # -> 1d tensor
       is_replaced = is_replaced.masked_select(non_pad) # -> 1d tensor
+    if c.invert_label:
+      is_replaced = ~is_replaced
     if self.disc_label_smooth:
       eps = self.disc_label_smooth if isinstance(self.disc_label_smooth, float) else 0.1
       zeros = ~is_replaced
@@ -290,7 +330,7 @@ class ELECTRALoss():
 # # 4. Learning rate schedule
 
 # %%
-def linear_warmup_and_decay(pct_now, lr_max, end_lr, decay_power, total_steps,warmup_pct=None, warmup_steps=None):
+def mmlinear_warmup_and_decay(pct_now, lr_max, end_lr, decay_power, total_steps, fake_total_steps, warmup_pct=None, warmup_steps=None):
   assert warmup_pct or warmup_steps
   if warmup_steps: warmup_pct = warmup_steps/total_steps
   """
@@ -302,6 +342,7 @@ def linear_warmup_and_decay(pct_now, lr_max, end_lr, decay_power, total_steps,wa
   pct updated after_batch, but global_step (in tf) seems to update before optimizer step,
   so pct is actually (global_step -1)/total_steps 
   """
+  
   fixed_pct_now = pct_now + 1/total_steps
   """
   According to source code of the official repository, it seems they merged two lr schedule (warmup and linear decay)
@@ -314,15 +355,38 @@ def linear_warmup_and_decay(pct_now, lr_max, end_lr, decay_power, total_steps,wa
 
 
 # %%
+def linear_warmup_and_decay(pct, lr_max, warmup_steps, total_steps, fake_total_steps=None, end_lr=0.0, decay_power=1):
+  """
+  pct (float):
+  """
+  step_i = round(pct * (fake_total_steps if fake_total_steps else total_steps)) + 1
+  #if step_i >= 1000:
+  #  bk()
+  decayed_lr = (lr_max-end_lr) * (1 - step_i/total_steps) ** decay_power + end_lr
+  warmed_lr = decayed_lr * min(1.0, step_i/warmup_steps)
+  return warmed_lr
+
+
+# %%
 lr_shedule = ParamScheduler({'lr': partial(linear_warmup_and_decay,
                                             lr_max=c.lr,
-                                            end_lr=0.0,
-                                            decay_power=1,
                                             warmup_steps=10000 if not c.percent else int(0.1 * c.percent * 10**6),
-                                            total_steps=c.steps if not c.percent else int(c.percent * c.steps))})
+                                            total_steps=c.steps if not c.percent else int(c.percent * c.steps),
+                                            fake_total_steps=len(dls[0])*9999)})
 
 # %% [markdown]
 # # 5. Train
+
+# %%
+class GradientClipping(Callback):
+    "Gradient clipping during training."
+    def __init__(self, clip:float = 0.):
+        self.clip = clip
+
+    def after_backward(self):
+        "Clip the gradient before the optimizer step."
+        if self.clip: nn.utils.clip_grad_norm_(self.learn.model.parameters(), self.clip)
+
 
 # %%
 def now_time():
@@ -332,9 +396,14 @@ def now_time():
 
 
 # %%
-electra_model = ELECTRAModel(HF_Model(ElectraForMaskedLM, gen_config, hf_tokenizer, variable_sep=True), 
-                             HF_Model(ElectraForPreTraining, disc_config, hf_tokenizer, variable_sep=True),
-                             hf_tokenizer.pad_token_id,)
+if c.load_smallplusplus:
+    generator = HF_Model(ElectraForMaskedLM, f'google/electra-{c.size}-generator' , hf_tokenizer, variable_sep=True)
+    discriminator = HF_Model(ElectraForPreTraining, f"google/electra-{c.size}-discriminator", hf_tokenizer, variable_sep=True)
+else:
+    generator = HF_Model(ElectraForMaskedLM, gen_config, hf_tokenizer, variable_sep=True)
+    discriminator = HF_Model(ElectraForPreTraining, disc_config, hf_tokenizer, variable_sep=True)
+
+electra_model = ELECTRAModel(generator, discriminator)
 electra_loss_func = ELECTRALoss(pad_idx=hf_tokenizer.pad_token_id, gen_label_smooth=c.gen_smooth_label, disc_label_smooth=c.disc_smooth_label)
 
 dls.to(torch.device(c.device))
@@ -346,11 +415,21 @@ learn = Learner(dls, electra_model,
                 path=str(c.checkpoint_dir),
                 model_dir='electra_pretrain',
                 cbs=[mlm_cb,
-                    RunSteps(c.steps, [0.0625, 0.125, 0.5, 1.0], run_name+"_{percent}") if not c.percent else RunSteps(int(c.steps*c.percent)),
+                    RunSteps(c.steps, [0.0625, 0.125, 0.5, 1.0], run_name+"_{percent}") if not c.percent else RunSteps(int(c.steps*c.percent))
                     ],
                 )
-if c.use_fp16: learn = learn.to_fp16()
+
+if c.use_fp16: learn = learn.to_fp16(max_loss_scale=2.**11, scale_wait=int(c.steps*0.01), clip=1.)
+else: learn.add_cb(GradientClipping(1.))
+# to also exclude layernorm
+learn.create_opt()
+for p in my_bn_bias_state(learn, True): p['do_wd'] = False 
+# ----------------------------
 learn.fit(9999, cbs=[lr_shedule])
 if c.percent: learn.save(run_name)
+
+
+# %%
+
 
 

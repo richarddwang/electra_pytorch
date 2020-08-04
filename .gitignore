@@ -1,4 +1,4 @@
-/.vscode/*
+.vscode/*
 /wandb/*
 **/__pycache__/
 /.ipynb_checkpoints/*
@@ -6,3 +6,6 @@
 *.log
 nohup.out
 /electra/*
+datasets
+datasets/*
+checkpoints/*

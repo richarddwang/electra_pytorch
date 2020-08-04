@@ -1,6 +1,7 @@
 from tqdm import tqdm
 import sklearn.metrics as skm
 import scipy.stats as scs
+from torch import nn
 from fastai2.text.all import *
 
 """
@@ -62,3 +63,15 @@ class MyMSELossFlat(BaseLoss):
     if self.low is not None: x = torch.max(x, x.new_full(x.shape, self.low))
     if self.high is not None: x = torch.min(x, x.new_full(x.shape, self.high))
     return x
+
+my_norm_types = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d, nn.LayerNorm)
+
+# Cell
+def my_bn_bias_params(m, with_bias=True): # TODO: Rename to `norm_bias_params`
+    "Return all bias and BatchNorm parameters"
+    if isinstance(m, my_norm_types): return L(m.parameters())
+    res = L(m.children()).map(my_bn_bias_params, with_bias=with_bias).concat()
+    if with_bias and getattr(m, 'bias', None) is not None: res.append(m.bias)
+    return res
+
+def my_bn_bias_state(self, with_bias): return my_bn_bias_params(self.model, with_bias).map(self.opt.state)

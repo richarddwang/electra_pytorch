@@ -10,6 +10,7 @@ import torch
 from torch import nn
 import nlp
 from transformers import ElectraModel, ElectraConfig, ElectraTokenizerFast, ElectraForPreTraining
+from transformers.modeling_electra import ElectraClassificationHead
 from fastai2.text.all import *
 import wandb
 from fastai2.callback.wandb import WandbCallback
@@ -23,15 +24,16 @@ c = MyConfig({
   # device to train and test
   'device': 'cuda:3', # specify List[int] to use multi gpu (data parallel), None for using all gpu devices
   # the id that in the name of runs which are in the same group (to choose the best from 10 runs and ..)
-  'group_id': random.randint(1,999), # None to not save checkpoint and not create wandb run 
+  'group_id': 172119125, #random.randint(1,999), # None to not save checkpoint and not create wandb run 
   # checkpoint of ELECTRA from pretrain.py, note that only discriminator part of it will be extracted and used
-  'pretrained_checkpoint': None,# Path.home()/'checkpoints/electra_pretrain/7-19_08-31-14_6.25%.pth', # None to use checkpoints hubbed on Huggingface
+  'pretrained_checkpoint': Path.home()/'checkpoints/electra_pretrain/8-03_17-21-19_12.5%.pth', # None to use checkpoints hubbed on Huggingface
+  'head': 'slp',
   # whether to use wnli trick described in the paper
   'wsc_trick': True,
   # size of ELECTRA
   'size': 'small',
-  'max_length': 512, # 128 only if ELECTRA-small (note that all public models are ++model which use 512)
-  # where to cache the data
+  'max_length': 128, # 128 only if ELECTRA-small (note that all public models are ++model which use 512)
+  # cache the data under it
   'cache_dir': Path.home()/'datasets', # ! should be `pathlib.Path` istance
   # where to save finetuneing checkpoints
   'ckp_dir': Path.home()/'checkpoints/electra_glue', # ! should be `pathlib.Path` istance
@@ -44,7 +46,7 @@ c = MyConfig({
              'wnli': [22,3,10,14,8,0,17,20,2,6],
             }
 })
-
+assert c.head in ['slp', 'mlp', 'mlp_load']
 if c.size == 'small' and c.pretrained_checkpoint: assert c.max_length == 128, "Make sure max_length is 128 for ELECTRA-small, or comment this line if you know what you are doing."
 if c.pretrained_checkpoint is None: assert c.max_length == 512, "All public models of ELECTRA is ++, and use max_length 512 when finetuning on GLUE"
 if c.wsc_trick:
@@ -98,7 +100,7 @@ glue_dsets = {}; glue_dls = {}
 for task in ['cola', 'sst2', 'mrpc', 'qqp', 'stsb', 'mnli', 'qnli', 'rte', 'wnli', 'ax']:
   # General case and special case for WSC
   if task == 'wnli' and c.wsc_trick:
-    benchmark, subtask = 'super_glue', 'wsc.fixed'
+    benchmark, subtask = 'super_glue', 'wsc'
     # samples in all splits are all less than 128-2, so don't need to worry about max_length
     Tfm = partial(WSCTrickTfm, hf_toker=hf_tokenizer)
     cols = {'prefix':TensorText, 'suffix':TensorText, 'cands':TensorText, 'cand_lens':noop, 'label':TensorCategory}
@@ -118,13 +120,90 @@ for task in ['cola', 'sst2', 'mrpc', 'qqp', 'stsb', 'mnli', 'qnli', 'rte', 'wnli
                                           cache_file_name=str(c.cache_dir/'glue/qqp/1.0.0/fixed_train.arrow'))
   # 
   if task=='wnli' and c.wsc_trick: dsets['train'] = dsets['train'].filter(lambda e: e['label']==1,
-                 cache_file_name=str(c.cache_dir/'super_glue/wsc.fixed/1.0.2/filtered_tricked_train.arrow'))
+                 cache_file_name=str(c.cache_dir/'super_glue/wsc/1.0.2/filtered_tricked_train.arrow'))
   # load / make tokenized datasets
   glue_dsets[task] = Tfm(dsets).map(cache_name=cache_name)
   # load / make dataloaders
   hf_dsets = HF_Datasets(glue_dsets[task], cols=cols, hf_toker=hf_tokenizer, n_inp=n_inp)
   dl_cache_name = cache_name.replace('tokenized', 'dl').replace('.arrow', '.json')
   glue_dls[task] = hf_dsets.dataloaders(bs=32, cache_name=dl_cache_name)
+
+# %% [markdown]
+# ## 1.2 View Data
+# - View raw data on [nlp-viewer]! (https://huggingface.co/nlp/viewer/)
+# 
+# - View task description on Tensorflow dataset doc for GLUE (https://www.tensorflow.org/datasets/catalog/glue) 
+# 
+# - You may notice some text without \[SEP\], that is because the whole sentence is truncated by `show_batch`, you can turn it off by specify `truncated_at=None`
+# %% [markdown]
+# 
+
+# %%
+# CoLA (The Corpus of Linguistic Acceptability) - 0: unacceptable, 1: acceptable 
+print("Dataset size (train/valid/test): {}/{}/{}".format(*[len(dl.dataset) for dl in glue_dls['cola'].loaders]))
+glue_dls['cola'].show_batch(max_n=1)
+
+# %% [markdown]
+# 
+# %% [markdown]
+# 
+
+# %%
+# SST-2 (The Stanford Sentiment Treebank) - 1: positvie, 0: negative
+print("Dataset size (train/valid/test): {}/{}/{}".format(*[len(dl.dataset) for dl in glue_dls['sst2'].loaders]))
+glue_dls['sst2'].show_batch(max_n=1)
+
+
+# %%
+# MRPC (Microsoft Research Paraphrase Corpus) -  1: match, 0: no
+print("Dataset size (train/valid/test): {}/{}/{}".format(*[len(dl.dataset) for dl in glue_dls['mrpc'].loaders]))
+glue_dls['mrpc'].show_batch(max_n=1)
+
+# %% [markdown]
+# 
+
+# %%
+# STS-B (Semantic Textual Similarity Benchmark) - 0.0 ~ 5.0
+print("Dataset size (train/valid/test): {}/{}/{}".format(*[len(dl.dataset) for dl in glue_dls['stsb'].loaders]))
+glue_dls['stsb'].show_batch(max_n=1)
+
+
+# %%
+# QQP (Quora Question Pairs) - 0: no, 1: duplicated
+print("Dataset size (train/valid/test): {}/{}/{}".format(*[len(dl.dataset) for dl in glue_dls['qqp'].loaders]))
+glue_dls['qqp'].show_batch(max_n=1)
+
+
+# %%
+# MNLI (The Multi-Genre NLI Corpus) - 0: entailment, 1: neutral, 2: contradiction
+print("Dataset size (train/validation_matched/validation_mismatched/test_matched/test_mismatched): {}/{}/{}/{}/{}".format(*[len(dl.dataset) for dl in glue_dls['mnli'].loaders]))
+glue_dls['mnli'].show_batch(max_n=1)
+
+
+# %%
+# QNLI (The Stanford Question Answering Dataset) - 0: entailment, 1: not_entailment
+print("Dataset size (train/valid/test): {}/{}/{}".format(*[len(dl.dataset) for dl in glue_dls['qnli'].loaders]))
+glue_dls['qnli'].show_batch(max_n=1)
+
+
+# %%
+# RTE (Recognizing_Textual_Entailment) - 0: entailment, 1: not_entailment
+print("Dataset size (train/valid/test): {}/{}/{}".format(*[len(dl.dataset) for dl in glue_dls['rte'].loaders]))
+glue_dls['rte'].show_batch(max_n=1)
+
+
+# %%
+# WSC (The Winograd Schema Challenge) - 0: wrong, 1: correct
+# There are three style, WNLI (casted in NLI type), WSC, WSC with candidates (trick used by Roberta)
+"Note for WSC trick: cands is the concatenation of candidates, cand_lens is the lengths of candidates in order."
+print("Dataset size (train/valid/test): {}/{}/{}".format(*[len(dl.dataset) for dl in glue_dls['wnli'].loaders]))
+glue_dls['wnli'].show_batch(max_n=1)
+
+
+# %%
+# AX (GLUE Diagnostic Dataset) - 0: entailment, 1: neutral, 2: contradiction
+print("Dataset size (test): {}".format(*[len(dl.dataset) for dl in glue_dls['ax'].loaders]))
+glue_dls['ax'].show_batch(max_n=1)
 
 # %% [markdown]
 # # 2. Finetuning model
@@ -206,6 +285,7 @@ TARG_VOC_SIZE = {
     **{ task:3 for task in ['mnli','ax']}
 }
 
+
 # %%
 def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
   
@@ -219,17 +299,26 @@ def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
   elif isinstance(c.device, list): dls.to(torch.device('cuda', c.device[0]))
   else: dls.to(torch.device('cuda:0'))
   # load model
-  if c.pretrained_checkpoint: 
+  if c.pretrained_checkpoint is not None: 
     discriminator = HF_Model(ElectraForPreTraining, electra_config, hf_tokenizer)
-    load_part_model(c.pretrained_checkpoint, discriminator, 'discriminator')
+    if c.pretrained_checkpoint:
+      load_part_model(c.pretrained_checkpoint, discriminator, 'discriminator')
   else:
     discriminator = HF_Model(ElectraForPreTraining, f"google/electra-{c.size}-discriminator", hf_tokenizer)
   # model
   if task=='wnli' and c.wsc_trick:
     model = ELECTRAWSCTrickModel(discriminator, hf_tokenizer.pad_token_id)
-  else: # take only base model and mount an output layer
+  elif c.head=='slp': # take only base model and mount an output layer
     model = nn.Sequential(HF_Model(discriminator.model.electra, hf_toker=hf_tokenizer), 
                           SentencePredictHead(electra_config.hidden_size, targ_voc_size=TARG_VOC_SIZE[task]))
+  else:
+    _config = deepcopy(electra_config)
+    _config.num_labels = TARG_VOC_SIZE[task]
+    if c.head=='mlp_load':
+      cls_head = ElectraClassificationHead(_config)
+      cls_head.dense = discriminator.model.discriminator_predictions.dense
+    model = nn.Sequential(HF_Model(discriminator.model.electra, hf_toker=hf_tokenizer), 
+                          cls_head)
   # loss func
   if task == 'stsb': loss_fc = MyMSELossFlat(low=0.0, high=5.0)
   elif task=='wnli' and c.wsc_trick: loss_fc = ELECTRAWSCTrickLoss()
@@ -267,7 +356,7 @@ def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
     learn.model = nn.DataParallel(learn.model, device_ids=c.device)
 
   # fp16
-  if c.device != 'cpu': learn = learn.to_fp16()
+  #if c.device != 'cpu': learn = learn.to_fp16(clip=1.)
 
   # wandb
   if run_name:
@@ -281,12 +370,13 @@ def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
 
 # %%
 if c.do_finetune:
-  for i in range(5):
+  for i in range(5,10):
     for task in ['cola', 'sst2', 'mrpc', 'stsb', 'qnli', 'rte', 'qqp', 'mnli', 'wnli']:
       if task in ['wnli']: continue # to only do some tasks
       if c.group_id: run_name = f"{task}_{c.group_id}_{i}";
       else: run_name = None; print(task)
       learn, fit_fc = get_glue_learner(task, run_name)
+      #bk()
       fit_fc()
       if run_name:
         wandb.join()
@@ -391,4 +481,5 @@ if not c.do_finetune:
     dl_idxs = [-1, -2] if task=='mnli' else [-1]
     for dl_idx in dl_idxs:
       df = predict_test(task, ckp, dl_idx, output_dir=c.cache_dir/f'glue/test/{c.out_dir}')
+
 
