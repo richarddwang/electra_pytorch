@@ -1,121 +1,38 @@
-import time
-from statistics import mean, stdev
-import torch
-# from fastai2.callback.all import * # name 'store_attr' is not defined
+from functools import partial
 from fastai2.text.all import * 
-
-class RunSteps(Callback):
-  toward_end = True
-  
-  def __init__(self, n_steps, save_points=None, base_name=None, no_val=True):
-    """
-    Args:
-      `n_steps` (`Int`): Run how many steps, could be larger or smaller than `len(dls.train)`
-      `savepoints` 
-      - (`List[Float]`): save when reach one of percent specified.
-      - (`List[Int]`): save when reache one of steps specified
-      `base_name` (`String`): a format string with `{percent}` to be passed to `learn.save`.
-    """
-    if save_points is None: save_points = []
-    else:
-      assert '{percent}' in base_name
-      save_points = [ s if isinstance(s,int) else int(n_steps*s) for s in save_points ]
-      for sp in save_points: assert sp != 1, "Are you sure you want to save after 1 steps, instead of 1.0 * num_steps ?"
-      assert max(save_points) <= n_steps
-    store_attr(self, 'n_steps,save_points,base_name,no_val')
-
-  def after_batch(self):
-    if self.train_iter in self.save_points:
-      percent = (self.train_iter/self.n_steps)*100
-      self.learn.save(self.base_name.format(percent=f'{percent}%'))
-    if self.train_iter == self.n_steps:
-      raise CancelFitException
-
-  def after_train(self):
-    if self.no_val:
-      if self.train_iter == self.n_steps:
-        pass # CancelFit is raised, don't overlap it with CancelEpoch
-      else:
-        raise CancelEpochException
-
-_MESSAGE = [
-  'dl.train load a batch + begin_batch',
-  'forward + after_pred',
-  'loss calculation + after_loss',
-  'backward + after_backward',
-  'parameter updating + after_step',
-  'after_batch',
-]
-
-@delegates()
-class Timer(RunSteps):
-  toward_end=True
-
-  def __init__(self, n_steps, ignore_first_n=1, break_after=None, precision=3, **kwargs):
-    """
-    Args:
-      `n_steps`: Average on how many training steps.
-      `ignore_first_n`: Not use first n steps to average. Setting it at least 1 to avoid counting initilization time of dataloader is suggested.
-      `break_after`: one of ['begin_batch',...'after_batch']
-      `precision`
-    """
-    steps = ignore_first_n + n_steps
-    super().__init__(steps, **kwargs)
-    store_attr(self, 'steps,break_after,ignore_first_n,precision')
-
-  def time_delta(self): 
-    delta = time.time() - self.timepoint
-    self.timepoint = time.time()
-    return delta
-
-  def begin_fit(self):
-    self.times = [ [] for _ in range(6)]
-    self.timepoint = time.time()
-  def begin_batch(self):
-    self.times[0].append(self.time_delta())
-    if self.break_after=='begin_batch': raise CancelBatchException
-  def after_pred(self):
-    self.times[1].append(self.time_delta())
-    if self.break_after=='after_pred': raise CancelBatchException
-  def after_loss(self): 
-    self.times[2].append(self.time_delta())
-    if self.break_after=='after_loss': raise CancelBatchException
-  def after_backward(self): 
-    self.times[3].append(self.time_delta())
-    if self.break_after=='after_backward': raise CancelBatchException
-  def after_step(self):
-    self.times[4].append(self.time_delta())
-    if self.break_after=='after_step': raise CancelBatchException
-  def after_batch(self):
-    if self.break_after=='after_batch' or not self.break_after:
-      self.times[5].append(self.time_delta())
-    if self.train_iter == self.steps:
-      self.show()
-    super().after_batch()
-
-  def show(self):
-    print(f"show average and standard deviation of step {self.ignore_first_n+1} ~ step {self.train_iter} (total {self.steps-self.ignore_first_n} training steps)")
-    # print for each stage
-    for i, deltas in enumerate(self.times):
-      if len(deltas)==0: time_message = "Skipped or Exception raised by callbacks ran before Timer."
-      else:
-        m,s = mean(deltas[self.ignore_first_n:]), stdev(deltas[self.ignore_first_n:])
-        time_message = f"avg {round(m, self.precision)} secs ± stdev {round(s, self.precision)}"
-      print(f"{(_MESSAGE[i]+':'):36} {time_message}")
-    # print for total
-    times = list(filter(None, self.times))
-    ## Some callback (e.g. MixedPrecisionCallback) might skip some stage "sometimes", so the length might be not equal 
-    max_len = max( len(deltas) for deltas in times )
-    for i, deltas in enumerate(times):
-      if len(deltas) < max_len: times[i] += [0]*(max_len - len(deltas))
-    ## calculate
-    times = torch.tensor(times)[:,self.ignore_first_n:]
-    total_m, total_s = times.sum(0).mean().item(), times.sum(0).std().item()
-    print(f"Total: avg {round(total_m, self.precision)} secs ± stdev {round(total_s, self.precision)} secs")
 
 class MyConfig(dict):
   def __getattr__(self, name): return self[name]
   def __setattr__(self, name, value): self[name] = value
+
+def adam_no_correction_step(p, lr, mom, step, sqr_mom, grad_avg, sqr_avg, eps, **kwargs):
+    p.data.addcdiv_(grad_avg, (sqr_avg).sqrt() + eps, value = -lr)
+    return p
+
+def Adam_no_bias_correction(params, lr, mom=0.9, sqr_mom=0.99, eps=1e-5, wd=0.01, decouple_wd=True):
+    "A `Optimizer` for Adam with `lr`, `mom`, `sqr_mom`, `eps` and `params`"
+    cbs = [weight_decay] if decouple_wd else [l2_reg]
+    cbs += [partial(average_grad, dampening=True), average_sqr_grad, step_stat, adam_no_correction_step]
+    return Optimizer(params, cbs, lr=lr, mom=mom, sqr_mom=sqr_mom, eps=eps, wd=wd)
+
+def linear_warmup_and_decay(pct, lr_max, total_steps, fake_total_steps=None, warmup_steps=None, warmup_pct=None, end_lr=0.0, decay_power=1):
+  """ pct (float): fastai count it as ith_step/num_epoch*len(dl), so we can't just use pct when our num_epoch is fake.he ith_step is count from 0, """
+  if warmup_pct: warmup_steps = int(warmup_pct * total_steps)
+  step_i = round(pct * (fake_total_steps if fake_total_steps else total_steps)) + 1 # fastai count step from 0, so we have to add 1 back
+  # According to the original source code, two schedules take effect at the same time, but decaying schedule will be neglible in the early time.
+  decayed_lr = (lr_max-end_lr) * (1 - step_i/total_steps) ** decay_power + end_lr # https://www.tensorflow.org/api_docs/python/tf/compat/v1/train/polynomial_decay
+  warmed_lr = decayed_lr * min(1.0, step_i/warmup_steps) # https://github.com/google-research/electra/blob/81f7e5fc98b0ad8bfd20b641aa8bc9e6ac00c8eb/model/optimization.py#L44
+  return warmed_lr
+
+def linear_warmup_and_then_decay(pct, lr_max, total_steps, fake_total_steps=None, warmup_steps=None, warmup_pct=None, end_lr=0.0, decay_power=1):
+  """ pct (float): fastai count it as ith_step/num_epoch*len(dl), so we can't just use pct when our num_epoch is fake.he ith_step is count from 0, """
+  if warmup_pct: warmup_steps = int(warmup_pct * total_steps)
+  step_i = round(pct * (fake_total_steps if fake_total_steps else total_steps)) + 1 # fastai count step from 0, so we have to add 1 back
+  if step_i <= warmup_steps: # warm up
+    return lr_max * min(1.0, step_i/warmup_steps)
+  else: # decay
+    return (lr_max-end_lr) * (1 - (step_i-warmup_steps)/(total_steps-warmup_steps)) ** decay_power + end_lr
+  return warmed_lr
 
 def load_part_model(file, model, prefix, device=None, strict=True):
   "assume `model` is part of (child attribute at any level) of model whose states save in `file`."
@@ -128,3 +45,18 @@ def load_part_model(file, model, prefix, device=None, strict=True):
   model_state = state['model'] if hasopt else state
   model_state = {k[len(prefix):] : v for k,v in model_state.items() if k.startswith(prefix)}
   get_model(model).load_state_dict(model_state, strict=strict)
+
+def load_model_(learn, files, device=None, **kwargs):
+  "if multiple file passed, then load and create an ensemble. Load normally otherwise"
+  merge_out_fc = kwargs.pop('merge_out_fc', None)
+  if not isinstance(files, list): 
+    learn.load(files, device=device, **kwargs)
+    return
+  if device is None: device = learn.dls.device
+  model = learn.model.cpu()
+  models = [model, *(deepcopy(model) for _ in range(len(files)-1)) ]
+  for f,m in zip(files, models):
+    file = join_path_file(f, learn.path/learn.model_dir, ext='.pth')
+    load_model(file, m, learn.opt, device='cpu', **kwargs)
+  learn.model = Ensemble(models, device, merge_out_fc)
+  return learn
