@@ -1,7 +1,7 @@
 # To add a new cell, type '# %%'
 # To add a new markdown cell, type '# %% [markdown]'
 # %%
-import os
+import os,sys
 from pathlib import Path
 from functools import partial
 import random
@@ -27,14 +27,17 @@ c = MyConfig({
   'start':9,
   'end': 10,
   
-  'adam_bias_correction': True,
-  'mixed_precision': 'fastai',
-  'pretrained_checkpoint': 'bc_native_34_6.25%.pth', # None to downalod model from HuggingFace
-  'group_name': 'bc_native_ff_34_6.25%', 
+  'pretrained_checkpoint': 'native_clip_1188_12.5%.pth', # None to downalod model from HuggingFace
+  'my_model': True,
+
+  'adam_bias_correction': False,
+  'mixed_precision': 'native',
+  'clip_gradient': True,
+  'wd': 0.01,
+  'group_name': 'native_clip_1188_12.5%_ncw', 
   
   'size': 'small',
   'wsc_trick': False,
-  'clip_gradient': False,
 
   # whether to do finetune or test
   'do_finetune': True, # True -> do finetune ; False -> do test
@@ -81,6 +84,13 @@ if c.group_name is not False and c.do_finetune:
     def after_epoch(self):
       if self.epoch == (self.n_epoch - 1): super().after_epoch()
   neptune.init(project_qualified_name='richard-wang/electra-glue')
+
+# my model
+if c.my_model:
+  sys.path.insert(0, os.path.abspath(".."))
+  from modeling.model import ModelForDiscriminator
+  from hyperparameter import electra_hparam_from_hf
+  hparam = electra_hparam_from_hf(electra_config, hf_tokenizer)
 
 # Path
 Path('./datasets').mkdir(exist_ok=True)
@@ -247,26 +257,40 @@ class SentencePredictor(nn.Module):
   def __init__(self, model, hidden_size, num_class):
     super().__init__()
     self.base_model = model
-    self.linear = nn.Linear(hidden_size, num_class)
     self.dropout = nn.Dropout(0.1)
+    self.classifier = nn.Linear(hidden_size, num_class)
   def forward(self, input_ids, attention_mask, token_type_ids):
     x = self.base_model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)[0]
-    return self.linear(self.dropout(x[:,0])).squeeze(-1).float() # if regression task, squeeze to (B), else (B,#class)
+    return self.classifier(self.dropout(x[:,0])).squeeze(-1).float() # if regression task, squeeze to (B), else (B,#class)
 
 # %% [markdown]
 # ## 2.2 Discriminative learning rate
 
 # %%
-# Names come from, for nm in model.named_modules(): print(nm[0])
-def hf_electra_param_splitter(model, num_hidden_layers, outlayer_name):
-  names = ['.embeddings', *[f'encoder.layer.{i}' for i in range(num_hidden_layers)], outlayer_name]
-  def end_with_any(name): return any( name.endswith(n) for n in names )
-  groups = [ list(mod.parameters()) for name, mod in model.named_modules() if end_with_any(name) ]
-  assert len(groups) == len(names)
+def list_parameters(model, submod_name):
+  return list(eval(f"model.{submod_name}").parameters())
+
+def hf_electra_param_splitter(model, wsc_trick=False):
+  base = 'discriminator.electra' if wsc_trick else 'base_model'
+  embed_name = 'embedding' if c.my_model else 'embeddings'
+  scaler_name = 'dimension_scaler' if c.my_model else 'embeddings_project'
+  layers_name = 'layers' if c.my_model else 'layer'
+  output_name = 'classifier' if not wsc_trick else f'discriminator.discriminator_predictions'
+
+  groups = [ list_parameters(model, f"{base}.{embed_name}") ]
+  for i in range(electra_config.num_hidden_layers):
+    groups.append( list_parameters(model, f"{base}.encoder.{layers_name}[{i}]") )
+  groups.append( list_parameters(model, output_name) )
+  if electra_config.hidden_size != electra_config.embedding_size:
+    groups[0] += list_parameters(model, f"{base}.{scaler_name}")
+  if c.my_model and hparam['pre_norm']:
+    groups[-1] += list_parameters(model, f"{base}.encoder.norm")
+
+  assert len(list(model.parameters())) == sum([ len(g) for g in groups])
   return groups
 
 def get_layer_lrs(lr, decay_rate_of_depth, num_hidden_layers):
-  # I think input layer as bottom and output layer as top, which make 'depth' mean different from the one of official repo 
+  # I think input layer as bottom and output layer as top, which make 'depth' mean different from the one of official repo
   return [ lr * (decay_rate_of_depth ** depth) for depth in reversed(range(num_hidden_layers+2))]
 
 # %% [markdown]
@@ -286,34 +310,27 @@ def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
   else: dls.to(torch.device('cuda:0'))
 
   # Load pretrained model
-  if c.pretrained_checkpoint:
-    discriminator = ElectraForPreTraining(electra_config)
-    load_part_model(c.pretrained_ckp_path, discriminator, 'discriminator')
-  else:
+  if not c.pretrained_checkpoint:
     discriminator = ElectraForPreTraining.from_pretrained(f"google/electra-{c.size}-discriminator")
+  else:
+    discriminator = ModelForDiscriminator(hparam) if c.my_model else ElectraForPreTraining(electra_config)
+    load_part_model(c.pretrained_ckp_path, discriminator, 'discriminator')
 
   # Create finetuning model
-  if task=='wnli' and c.wsc_trick:
-    raise NotImplementedError 
+  if task=='wnli' and c.wsc_trick: 
     model = ELECTRAWSCTrickModel(discriminator, hf_tokenizer.pad_token_id)
   else:
     model = SentencePredictor(discriminator.electra, electra_config.hidden_size, num_class=NUM_CLASS[task])
 
-  # Learning rate
-  splitter = partial(hf_electra_param_splitter, 
-                     num_hidden_layers=electra_config.num_hidden_layers,
-                     outlayer_name= 'discriminator_predictions' if task=='wnli' and c.wsc_trick else 'linear')
+  # Discriminative learning rates
+  splitter = partial( hf_electra_param_splitter, wsc_trick=(task=='wnli' and c.wsc_trick) )
   layer_lrs = get_layer_lrs(lr=c.lr, 
                             decay_rate_of_depth=c.layer_lr_decay,
                             num_hidden_layers=electra_config.num_hidden_layers,)
-  lr_shedule = ParamScheduler({'lr': partial(linear_warmup_and_decay,
-                                             lr_max=np.array(layer_lrs),
-                                             warmup_pct=0.1,
-                                             total_steps=num_epochs*(len(dls.train)))})
 
   # Optimizer
-  if c.adam_bias_correction: opt_func = partial(Adam, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=0.01)
-  else: opt_func = partial(Adam_no_bias_correction, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=0.01)
+  if c.adam_bias_correction: opt_func = partial(Adam, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=c.wd)
+  else: opt_func = partial(Adam_no_bias_correction, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=c.wd)
   
   # Learner
   learn = Learner(dls, model,
@@ -344,7 +361,12 @@ def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
 
   # Learning rate schedule
   if one_cycle: return learn, partial(learn.fit_one_cycle, n_epoch=num_epochs)
-  else: return learn, partial(learn.fit, n_epoch=num_epochs, cbs=[lr_shedule])
+  else:
+    lr_shedule = ParamScheduler({'lr': partial(linear_warmup_and_decay,
+                                             lr_max=np.array(layer_lrs),
+                                             warmup_pct=0.1,
+                                             total_steps=num_epochs*(len(dls.train)))})
+    return learn, partial(learn.fit, n_epoch=num_epochs, cbs=[lr_shedule])
 
 # %% [markdown]
 # ## 2.4 Do finetuning

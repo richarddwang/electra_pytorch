@@ -23,13 +23,17 @@ from _utils.would_like_to_pr import *
 
 # %%
 c = MyConfig({
-    'device': 'cuda:2',
-    'run_name': 'bc_native',
-    'adam_bias_correction': True,
-    'mixed_precision': 'native',
-    'use_clip': False,
-    'separate_lr_sched': False,
+    'device': 'cuda:1',
 
+    'my_model': True,
+    'adam_bias_correction': False,
+    'mixed_precision': 'native',
+    'use_clip': True,
+    'sort': False,
+    'base_run_name': 'native_clip', # run_name = {base_run_name}_{seed}
+    'seed': 11081, # 11081 36 1188 76 1 # None/False to randomly choose seed from [0,99999]
+
+    'separate_lr_sched': False,
     'sampling': 'fp32_gumbel',
     'electra_mask_style': True,
     'tie_gen_in_out_embedding': False,
@@ -37,17 +41,14 @@ c = MyConfig({
     'disc_smooth_label': False,
 
     'size': 'small',
-    'my_model': False,
-    'sort': False,
-    'seed':1081, # 34,
 })
 
 # Check and Default
 assert c.mixed_precision in [False, 'fastai', 'native']
 assert c.sampling in ['fp32_gumbel', 'fp16_gumbel', 'multinomial']
-if not c.run_name: c.run_name = str(datetime.now(timezone(timedelta(hours=+8))))[6:-13].replace(' ','').replace(':','').replace('-','')
-if not c.seed: c.seed = random.randint(0, 999)
-if c.seed: c.run_name += f'_{c.seed}'
+if not c.base_run_name: c.base_run_name = str(datetime.now(timezone(timedelta(hours=+8))))[6:-13].replace(' ','').replace(':','').replace('-','')
+if not c.seed: c.seed = random.randint(0, 99999)
+c.run_name = f'{c.base_run_name}_{c.seed}'
 if c.gen_smooth_label is True: c.gen_smooth_label = 0.1
 if c.disc_smooth_label is True: c.disc_smooth_label = 0.1
 
@@ -84,7 +85,7 @@ print(c)
 # %%
 if c.my_model:
   sys.path.insert(0, os.path.abspath(".."))
-  from modeling.model import Model
+  from modeling.model import ModelForGenerator,ModelForDiscriminator
   from hyperparameter import electra_hparam_from_hf
   gen_hparam = electra_hparam_from_hf(gen_config, hf_tokenizer)
   disc_hparam = electra_hparam_from_hf(disc_config, hf_tokenizer)
@@ -118,8 +119,8 @@ if c.size in ['small', 'base']:
     book = ELECTRADataTransform(book, is_docs=False, text_col='text', max_length=c.max_length, hf_toker=hf_tokenizer).map(cache_file_name=str(book_cache_dir/f"book_electra_{c.max_length}.arrow"))
 
   wb_data = HF_MergedDataset(wiki, book)
-  wb_dsets = HF_Datasets({'train': wb_data}, cols=['input_ids','attention_mask','token_type_ids'], hf_toker=hf_tokenizer, n_inp=3)
-  dls = wb_dsets.dataloaders(bs=c.bs, num_workers=16,
+  wb_dsets = HF_Datasets({'train': wb_data}, cols=['input_ids','sentA_lenth'], hf_toker=hf_tokenizer, n_inp=2)
+  dls = wb_dsets.dataloaders(bs=c.bs,
                              shuffle_train=True,
                              srtkey_fc=None if c.sort else False, 
                              cache_dir='./datasets/wikibook_dl', cache_name='dl_{split}.json')
@@ -134,11 +135,13 @@ else: # for large size
 
 # %%
 """
-Modified from HuggingFace/transformers (https://github.com/huggingface/transformers/blob/0a3d0e02c5af20bfe9091038c4fd11fb79175546/src/transformers/data/data_collator.py#L102). It is
-- few ms faster: intead of a[b] a on gpu b on cpu, tensors here are all in the same device
-- few tens of us faster: in how we create special token mask
+Modified from HuggingFace/transformers (https://github.com/huggingface/transformers/blob/0a3d0e02c5af20bfe9091038c4fd11fb79175546/src/transformers/data/data_collator.py#L102). 
+It is a little bit faster cuz 
+- intead of a[b] a on gpu b on cpu, tensors here are all in the same device
+- don't iterate the tensor when create special tokens mask
+And
 - doesn't require huggingface tokenizer
-- cost you only 20 ms on a (128,128) tensor, so dynamic masking is cheap   
+- cost you only 550 µs for a (128,128) tensor on gpu, so dynamic masking is cheap   
 """
 def mask_tokens(inputs, mask_token_index, vocab_size, special_token_indices, mlm_probability=0.15, replace_prob=0.1, orginal_prob=0.1, ignore_index=-100):
   """ 
@@ -188,17 +191,17 @@ class MaskedLMCallback(Callback):
                                **kwargs)
 
   def before_batch(self):
-    text_indices, attention_mask, token_type_ids  = self.xb
-    masked_inputs, labels, is_mlm_applied = self.mask_tokens(text_indices)
+    input_ids, sentA_lenths  = self.xb
+    masked_inputs, labels, is_mlm_applied = self.mask_tokens(input_ids)
     if self.for_electra:
-      self.learn.xb, self.learn.yb = (masked_inputs, attention_mask, token_type_ids, is_mlm_applied, labels), (labels,)
+      self.learn.xb, self.learn.yb = (masked_inputs, sentA_lenths, is_mlm_applied, labels), (labels,)
     else:
-      self.learn.xb, self.learn.yb = (masked_inputs, attention_mask, token_type_ids), (labels,)
+      self.learn.xb, self.learn.yb = (masked_inputs, sentA_lenths), (labels,)
 
   @delegates(TfmdDL.show_batch)
   def show_batch(self, dl, idx_show_ignored, verbose=True, **kwargs):
     b = dl.one_batch()
-    input_ids, attention_mask, token_type_ids  = b
+    input_ids, sentA_lenths  = b
     masked_inputs, labels, is_mlm_applied = self.mask_tokens(input_ids.clone())
     # check
     assert torch.equal(is_mlm_applied, labels!=self.ignore_index)
@@ -212,7 +215,7 @@ class MaskedLMCallback(Callback):
       print("Notice 2. Special tokens (CLS, SEP) won't be masked.")
       print("Notice 3. Dynamic masking: every time you run gives you different results.")
     # show
-    tfm_b =(masked_inputs, attention_mask, token_type_ids, is_mlm_applied, labels) if self.for_electra else (masked_inputs, attention_mask, token_type_ids, labels)   
+    tfm_b =(masked_inputs, sentA_lenths, is_mlm_applied, labels) if self.for_electra else (masked_inputs, sentA_lenths, labels)   
     dl.show_batch(b=tfm_b, **kwargs)
 
 
@@ -233,11 +236,11 @@ mlm_cb = MaskedLMCallback(mask_tok_id=hf_tokenizer.mask_token_id,
 # %%
 class ELECTRAModel(nn.Module):
   
-  def __init__(self, generator, discriminator):
+  def __init__(self, generator, discriminator, hf_tokenizer):
     super().__init__()
     self.generator, self.discriminator = generator,discriminator
     self.gumbel_dist = torch.distributions.gumbel.Gumbel(0.,1.)
-    self.toker = hf_tokenizer
+    self.hf_tokenizer = hf_tokenizer
 
   def to(self, *args, **kwargs):
     "Also set dtype and device of contained gumbel distribution if needed"
@@ -247,15 +250,14 @@ class ELECTRAModel(nn.Module):
     if c.sampling=='fp32_gumbel': dtype = torch.float32
     self.gumbel_dist = torch.distributions.gumbel.Gumbel(torch.tensor(0., device=device, dtype=dtype), torch.tensor(1., device=device, dtype=dtype))
 
-  def forward(self, masked_inputs, attention_mask, token_type_ids, is_mlm_applied, labels):
+  def forward(self, masked_inputs, sentA_lenths, is_mlm_applied, labels):
     """
     masked_inputs (Tensor[int]): (B, L)
-    attention_mask (Tensor[int]): (B, L), 1 for non pad, 0 for pad
-    tokey_type_ids (Tensor[int]): (B, L), 0 for sentence A, 1 for sentence B
+    sentA_lenths (Tensor[int]): (B, L)
     is_mlm_applied (Tensor[boolean]): (B, L), True for positions chosen by mlm probability 
     labels (Tensor[int]): (B, L), -100 for positions where are not mlm applied
     """
-    
+    attention_mask, token_type_ids = self._get_pad_mask_and_token_type(masked_inputs, sentA_lenths)
     gen_logits = self.generator(masked_inputs, attention_mask, token_type_ids)[0] # (B, L, vocab size)
     
     # reduce size to save space and speed
@@ -272,6 +274,16 @@ class ELECTRAModel(nn.Module):
     disc_logits = self.discriminator(generated, attention_mask, token_type_ids)[0] # (B, L)
 
     return gen_logits, generated, disc_logits, is_replaced, attention_mask.bool()
+
+  def _get_pad_mask_and_token_type(self, input_ids, sentA_lenths):
+    """
+    Only cost you about 500 µs for (128, 128) on GPU, but so that your dataset won't need to save attention_mask and token_type_ids and won't be unnecessarily large, thus, prevent cpu processes loading batches from consuming lots of cpu memory and slow down the machine. 
+    """
+    attention_mask = input_ids != self.hf_tokenizer.pad_token_id
+    seq_len = input_ids.shape[1]
+    token_type_ids = torch.tensor([ ([0]*len + [1]*(seq_len-len)) for len in sentA_lenths.tolist()],  
+                                  device=input_ids.device)
+    return attention_mask, token_type_ids
 
   def sample(self, logits):
     "Reimplement gumbel softmax cuz there is a bug in torch.nn.functional.gumbel_softmax when fp16 (https://github.com/pytorch/pytorch/issues/41663). Gumbel softmax is equal to what official ELECTRA code do, standard gumbel dist. = -ln(-ln(standard uniform dist.))"
@@ -311,11 +323,10 @@ class ELECTRALoss():
 # %%
 # Generator and Discriminator
 if c.my_model:
-  raise NotImplementedError
   gen_hparam['tie_in_out_embedding'] = c.tie_gen_in_out_embedding
-  generator = Model(gen_hparam)
-  discriminator = Model(disc_hparam)
-  discriminator.embedding.tie_to(generator.embedding)
+  generator = ModelForGenerator(gen_hparam)
+  discriminator = ModelForDiscriminator(disc_hparam)
+  discriminator.electra.embedding = generator.electra.embedding
 else:
   generator = ElectraForMaskedLM(gen_config)
   discriminator = ElectraForPreTraining(disc_config)
@@ -324,7 +335,7 @@ else:
     generator.generator_predictions.dense.weight = generator.electra.embeddings.word_embeddings.weight
 
 # ELECTRA training loop
-electra_model = ELECTRAModel(generator, discriminator)
+electra_model = ELECTRAModel(generator, discriminator, hf_tokenizer)
 electra_loss_func = ELECTRALoss(gen_label_smooth=c.gen_smooth_label, disc_label_smooth=c.disc_smooth_label)
 
 # Optimizer
@@ -347,7 +358,7 @@ learn = Learner(dls, electra_model,
                 path='./checkpoints',
                 model_dir='pretrain',
                 cbs=[mlm_cb,
-                    RunSteps(c.steps, [0.0625, 0.125, 0.5, 1.0], c.run_name+"_{percent}"),
+                    RunSteps(c.steps, [0.0625, 0.125, 0.25, 0.5, 1.0], c.run_name+"_{percent}"),
                     ],
                 )
 
@@ -360,13 +371,12 @@ else:
   if c.use_clip: learn.add_cb(GradientClipping(1.))
 
 # Seed
-if c.seed:
-  random.seed(c.seed)
-  np.random.seed(c.seed)
-  torch.manual_seed(c.seed)
+random.seed(c.seed)
+np.random.seed(c.seed)
+torch.manual_seed(c.seed)
 
 # Run 
-print(c.run_name)
+print(f"{c.run_name} , starts at {datetime.now(timezone(timedelta(hours=+8)))}")
 #bk()
 learn.fit(9999, cbs=[lr_shedule])
 

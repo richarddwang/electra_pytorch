@@ -1,5 +1,6 @@
 from functools import partial
-from fastai2.text.all import * 
+from fastai2.text.all import *
+from hugdatafast.transform import CombineTransform
 
 class MyConfig(dict):
   def __getattr__(self, name): return self[name]
@@ -60,3 +61,108 @@ def load_model_(learn, files, device=None, **kwargs):
     load_model(file, m, learn.opt, device='cpu', **kwargs)
   learn.model = Ensemble(models, device, merge_out_fc)
   return learn
+
+@delegates(CombineTransform, but=["inp_cols", "out_cols", "init_attrs"])
+class ELECTRADataTransform(CombineTransform):
+  "Process any text corpus for ELECTRA's use"
+  def __init__(self, hf_dset, is_docs, text_col, max_length, hf_toker, delimiter='\n', **kwargs):
+    """
+    Args:
+      hf_dset (:class:`nlp.Dataset` or Dict[:class:`nlp.Dataset`]): **untokenized** Hugging Face dataset(s) to do the transform
+      is_docs (bool): Whether each sample of this dataset is a doc
+      text_col (str): the name of column of the dataset contains text 
+      max_length (str): max length of each sentence
+      hf_toker (:class:`transformers.PreTrainedTokenizer`): Hugging Face tokenizer
+      delimiter (str): what is the delimiter to segment sentences in the input text
+      kwargs: passed to :class:`CombineTransform`
+    """
+    self.is_docs = is_docs
+    self.in_col = text_col
+    self._current_sentences = []
+    self._current_length = 0
+    self._max_length = max_length
+    self._target_length = max_length
+    self.cls_idx, self.sep_idx = hf_toker.cls_token_id, hf_toker.sep_token_id
+    self.hf_toker = hf_toker
+    self.delimiter = delimiter
+    super().__init__(hf_dset, inp_cols=[self.in_col], out_cols=['input_ids','sentA_lenth'], 
+                    init_attrs=['_current_sentences', '_current_length', '_target_length'], **kwargs)
+
+  """
+  This two main functions adapts official source code creates pretraining dataset, to CombineTransform
+  """
+  def accumulate(self, text):
+    sentences = text.split(self.delimiter)
+    for sentence in sentences:
+      if not sentence: continue # skip empty
+      tokids = self.hf_toker.convert_tokens_to_ids(self.hf_toker.tokenize(sentence))
+      self.add_line(tokids)
+    # end of doc
+    if self.is_docs and self._current_length > 0:
+      self.commit_example(self.create_example())
+  
+  def create_example(self):
+    input_ids, sentA_lenth = self._create_example() # this line reset _current_sentences and _current_length in the end
+    return {'input_ids': input_ids, 'sentA_lenth':sentA_lenth}
+  # ...................................................
+
+  def add_line(self, tokids):
+    """Adds a line of text to the current example being built."""
+    self._current_sentences.append(tokids)
+    self._current_length += len(tokids)
+    if self._current_length >= self._target_length:
+      self.commit_example(self.create_example())
+
+  def _create_example(self):
+    """Creates a pre-training example from the current list of sentences."""
+    # small chance to only have one segment as in classification tasks
+    if random.random() < 0.1:
+      first_segment_target_length = 100000
+    else:
+      # -3 due to not yet having [CLS]/[SEP] tokens in the input text
+      first_segment_target_length = (self._target_length - 3) // 2
+
+    first_segment = []
+    second_segment = []
+    for sentence in self._current_sentences:
+      # the sentence goes to the first segment if (1) the first segment is
+      # empty, (2) the sentence doesn't put the first segment over length or
+      # (3) 50% of the time when it does put the first segment over length
+      if (len(first_segment) == 0 or
+          len(first_segment) + len(sentence) < first_segment_target_length or
+          (len(second_segment) == 0 and
+           len(first_segment) < first_segment_target_length and
+           random.random() < 0.5)):
+        first_segment += sentence
+      else:
+        second_segment += sentence
+
+    # trim to max_length while accounting for not-yet-added [CLS]/[SEP] tokens
+    first_segment = first_segment[:self._max_length - 2]
+    second_segment = second_segment[:max(0, self._max_length -
+                                         len(first_segment) - 3)]
+
+    # prepare to start building the next example
+    self._current_sentences = []
+    self._current_length = 0
+    # small chance for random-length instead of max_length-length example
+    if random.random() < 0.05:
+      self._target_length = random.randint(5, self._max_length)
+    else:
+      self._target_length = self._max_length
+
+    return self._make_example(first_segment, second_segment)
+
+  def _make_example(self, first_segment, second_segment):
+    """Converts two "segments" of text into a tf.train.Example."""
+    input_ids = [self.cls_idx] + first_segment + [self.sep_idx]
+    sentA_lenth = len(input_ids)
+    if second_segment:
+      input_ids += second_segment + [self.sep_idx]
+    return input_ids, sentA_lenth
+
+  def __getstate__(self):
+    "specify something you don't want pickle here, remember to use copy to not modfiy orginal instance"
+    state = self.__dict__.copy() 
+    state['hf_toker'] = None 
+    return state
