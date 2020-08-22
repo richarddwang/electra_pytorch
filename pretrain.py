@@ -23,15 +23,15 @@ from _utils.would_like_to_pr import *
 
 # %%
 c = MyConfig({
-    'device': 'cuda:1',
+    'device': 'cuda:3',
 
     'my_model': True,
     'adam_bias_correction': False,
     'mixed_precision': 'native',
     'use_clip': True,
-    'sort': False,
+    
     'base_run_name': 'native_clip', # run_name = {base_run_name}_{seed}
-    'seed': 11081, # 11081 36 1188 76 1 # None/False to randomly choose seed from [0,99999]
+    'seed': 1, # 11081 36 1188 76 1 # None/False to randomly choose seed from [0,99999]
 
     'separate_lr_sched': False,
     'sampling': 'fp32_gumbel',
@@ -41,6 +41,7 @@ c = MyConfig({
     'disc_smooth_label': False,
 
     'size': 'small',
+    'sort': False,
 })
 
 # Check and Default
@@ -258,22 +259,28 @@ class ELECTRAModel(nn.Module):
     labels (Tensor[int]): (B, L), -100 for positions where are not mlm applied
     """
     attention_mask, token_type_ids = self._get_pad_mask_and_token_type(masked_inputs, sentA_lenths)
-    gen_logits = self.generator(masked_inputs, attention_mask, token_type_ids)[0] # (B, L, vocab size)
+    if c.my_model:
+      gen_logits = self.generator(masked_inputs, attention_mask, token_type_ids, is_mlm_applied)[0]
+      # already reduced before the mlm output layer, save more space and speed
+      mlm_gen_logits = gen_logits # ( #mlm_positions, vocab_size)
+    else:
+      gen_logits = self.generator(masked_inputs, attention_mask, token_type_ids)[0] # (B, L, vocab size)
+      # reduce size to save space and speed
+      mlm_gen_logits = gen_logits[is_mlm_applied, :] # ( #mlm_positions, vocab_size)
     
-    # reduce size to save space and speed
-    mlm_gen_logits = gen_logits[is_mlm_applied, :] # ( #mlm_positions, vocab_size)
-    # sampling
-    pred_toks = self.sample(mlm_gen_logits) # ( #mlm_positions, )
-    # produce inputs for discriminator
-    generated = masked_inputs.clone() # (B,L)
-    generated[is_mlm_applied] = pred_toks # (B,L)
-    # produce labels for discriminator
-    is_replaced = is_mlm_applied.clone() # (B,L)
-    is_replaced[is_mlm_applied] = (pred_toks != labels[is_mlm_applied]) # (B,L)
+    with torch.no_grad():
+      # sampling
+      pred_toks = self.sample(mlm_gen_logits) # ( #mlm_positions, )
+      # produce inputs for discriminator
+      generated = masked_inputs.clone() # (B,L)
+      generated[is_mlm_applied] = pred_toks # (B,L)
+      # produce labels for discriminator
+      is_replaced = is_mlm_applied.clone() # (B,L)
+      is_replaced[is_mlm_applied] = (pred_toks != labels[is_mlm_applied]) # (B,L)
 
     disc_logits = self.discriminator(generated, attention_mask, token_type_ids)[0] # (B, L)
 
-    return gen_logits, generated, disc_logits, is_replaced, attention_mask.bool()
+    return mlm_gen_logits, generated, disc_logits, is_replaced, attention_mask.bool(), is_mlm_applied
 
   def _get_pad_mask_and_token_type(self, input_ids, sentA_lenths):
     """
@@ -302,8 +309,8 @@ class ELECTRALoss():
     self.disc_label_smooth = disc_label_smooth
     
   def __call__(self, pred, targ_ids):
-    gen_logits, generated, disc_logits, is_replaced, non_pad = pred
-    gen_loss = self.gen_loss_fc(gen_logits.float(), targ_ids) # ignore position where targ_id==-100
+    mlm_gen_logits, generated, disc_logits, is_replaced, non_pad, is_mlm_applied = pred
+    gen_loss = self.gen_loss_fc(mlm_gen_logits.float(), targ_ids[is_mlm_applied])
     disc_logits = disc_logits.masked_select(non_pad) # -> 1d tensor
     is_replaced = is_replaced.masked_select(non_pad) # -> 1d tensor
     if self.disc_label_smooth:
