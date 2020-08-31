@@ -13,7 +13,7 @@ import torch.nn.functional as F
 import torch.tensor as T
 import nlp
 from transformers import ElectraConfig, ElectraTokenizerFast, ElectraForMaskedLM, ElectraForPreTraining
-from fastai2.text.all import *
+from fastai.text.all import *
 from hugdatafast import *
 from _utils.utils import *
 from _utils.would_like_to_pr import *
@@ -23,16 +23,12 @@ from _utils.would_like_to_pr import *
 
 # %%
 c = MyConfig({
-    'device': 'cuda:0',
-
-    'my_model': True,
-    'adam_bias_correction': True,
-    'mixed_precision': 'native',
-    'use_clip': True,
+    'device': 'cuda:3',
     
-    'base_run_name': 'plus_bc', # run_name = {base_run_name}_{seed}
-    'seed': 76, # 11081 36 1188 76 1 # None/False to randomly choose seed from [0,99999]
+    'base_run_name': 'vanilla', # run_name = {base_run_name}_{seed}
+    'seed': 11081, # 11081 36 1188 76 1 # None/False to randomly choose seed from [0,99999]
 
+    'adam_bias_correction': False,
     'separate_lr_sched': False,
     'sampling': 'fp32_gumbel',
     'electra_mask_style': True,
@@ -41,9 +37,21 @@ c = MyConfig({
     'disc_smooth_label': False,
 
     'size': 'small',
-    'sort': False,
+    'my_model': False, # False to indicate using hf model
 })
 
+""" Vanilla ELECTRA settings
+'adam_bias_correction': False,
+'separate_lr_sched': False,
+'sampling': 'fp32_gumbel',
+'electra_mask_style': True,
+'tie_gen_in_out_embedding': False,
+'gen_smooth_label': False,
+'disc_smooth_label': False,
+"""
+
+
+# %%
 # Check and Default
 assert c.mixed_precision in [False, 'fastai', 'native']
 assert c.sampling in ['fp32_gumbel', 'fp16_gumbel', 'multinomial']
@@ -123,7 +131,7 @@ if c.size in ['small', 'base']:
   wb_dsets = HF_Datasets({'train': wb_data}, cols=['input_ids','sentA_lenth'], hf_toker=hf_tokenizer, n_inp=2)
   dls = wb_dsets.dataloaders(bs=c.bs,
                              shuffle_train=True,
-                             srtkey_fc=None if c.sort else False, 
+                             srtkey_fc=False, 
                              cache_dir='./datasets/wikibook_dl', cache_name='dl_{split}.json')
 
 else: # for large size
@@ -370,14 +378,11 @@ learn = Learner(dls, electra_model,
                 )
 
 # Mixed precison and Gradient clip
-if c.mixed_precision == 'fastai':
-  if c.use_clip: learn.to_fp16(max_loss_scale=2.**11, scale_wait=2000 , clip=1.0)
-  else: learn.to_fp16(max_loss_scale=2.**11, scale_wait=2000)
-else:
-  if c.mixed_precision == 'native': learn.to_native_fp16(init_scale=2.**11)
-  if c.use_clip: learn.add_cb(GradientClipping(1.))
+learn.to_native_fp16(init_scale=2.**11)
+learn.add_cb(GradientClipping(1.))
 
 # Seed
+torch.backends.cudnn.benchmark = False # set to True save you 1hr when training small model, but I rather want to get reproducibility
 random.seed(c.seed)
 np.random.seed(c.seed)
 torch.manual_seed(c.seed)

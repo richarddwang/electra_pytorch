@@ -12,7 +12,6 @@ import torch
 from torch import nn
 import nlp
 from transformers import ElectraModel, ElectraConfig, ElectraTokenizerFast, ElectraForPreTraining
-from transformers.modeling_electra import ElectraClassificationHead
 from fastai.text.all import *
 from hugdatafast import *
 from _utils.utils import *
@@ -23,54 +22,56 @@ from _utils.would_like_to_pr import *
 
 # %%
 c = MyConfig({
-  'device': 'cuda:1', #List[int]: use multi gpu (data parallel)
+
+  'device': 'cuda:0', #List[int]: use multi gpu (data parallel)
+  # run [start,end) runs, every run finetune every GLUE tasks once with different seeds.
   'start':0,
   'end': 10,
   
-  'pretrained_checkpoint': 'native_clip_1188_100.0%.pth',#'native_clip_1188_100.0%.pth', # None to downalod model from HuggingFace
-  # i th run across tasks use i th seeds, None to use system time
-  #'seeds': [939, 481, 569, 620, 159, 808, 816, 101, 554, 104], # for 11081
+  'pretrained_checkpoint': 'vanilla_11081_100.0%.pth', # None to downalod model from HuggingFace
+  # Seeds for fintuning. i th run use i th seeds, None to use system time
+  'seeds': [939, 481, 569, 620, 159, 808, 816, 101, 554, 104], # for 11081
   #'seeds': [611, 609, 830, 237, 668, 608, 475, 690, 53, 94], # for 36
-  'seeds': [775, 961, 778, 915, 979, 526, 99, 669, 806, 78], # for 1188
+  #'seeds': [775, 961, 778, 915, 979, 526, 99, 669, 806, 78], # for 1188
   #'seeds': [895, 602, 573, 457, 736, 871, 571, 84, 514, 740,], # for 76
-  'seeds': [760, 63, 392, 240, 794, 168, 245, 345, 97, 917], # 1
-  'my_model': True,
+  #'seeds': [760, 63, 392, 240, 794, 168, 245, 345, 97, 917], # 1 
 
   'adam_bias_correction': False,
-  'mixed_precision': False,
-  'clip_gradient': True,
-  'wd': 0.01,
-
-  'classifier_type': 'electra',
-  'reinit_outlayer': 'xavier',
-  # the name of represents these runs
-  'group_name': 'native_clip_1188_100.0%__cwex',#'native_clip_1188_100.0%_ncw',
-  # None: use name of checkpoint.
-  # False: don't do online logging and don't save checkpoints
-  
+  'xavier_reinited_outlayer': True,
   'separate_lr': False,
+  'original_lr_layer_decays': True,
+  
+  # whether to do finetune or test
+  'do_finetune': False, # True -> do finetune ; False -> do test
+  # finetuning checkpoint for testing. These will become "ckp_dir/{task}_{group_name}_{th_run}.pth"
+  'th_run': {'cola': 3, 'sst2': 8, 'mrpc': 4, 'qqp': 2, 'stsb': 9, 'qnli': 8, 'rte': 8, 'mnli': 4, 'ax': 4,
+             'wnli': 9, 
+             },
+  
   'size': 'small',
   'wsc_trick': False,
   'double_unordered': True,
-  'original_lr_layer_decays': True,
 
-  # whether to do finetune or test
-  'do_finetune': True, # True -> do finetune ; False -> do test
-  # finetuning checkpoint for testing. These will become "ckp_dir/{task}_{group_name}_{th_run}.pth"
-  'th_run': {'cola': 43, 'sst2': 8, 'mrpc': 6, 'qqp': 5, 'stsb': 3, 'qnli': 8, 'rte': 6, 'mnli': 1, 'ax': 1,
-             'wnli': [22,3,10,14,8,0,17,20,2,6], 
-             },
+  'my_model': False, # False to indicate using hf model
+  # the name of represents these runs
+  'group_name': None,
+  # None: use name of checkpoint.
+  # False: don't do online logging and don't save checkpoints
 })
 
-assert c.classifier_type in ['electra', 'hf_gelu', 'hf_tanh','funnel']
-assert c.reinit_outlayer in ['xavier', 'bert', 'kaiming']
+""" Vanilla ELECTRA settings
+'adam_bias_correction': False,
+'xavier_reinited_outlayer': True,
+'separate_lr': False,
+'original_lr_layer_decays': True,
+'double_unordered': True,
+"""
 
 
 # %%
 # Check
 if not c.do_finetune: assert c.th_run['mnli'] == c.th_run['ax']
-assert c.mixed_precision in [False, 'fastai', 'native']
-if c.mixed_precision: assert c.device != 'cpu'
+if c.pretrained_checkpoint is None: assert not c.my_model
 
 # Settings of different sizes
 if c.size == 'small': c.lr = 3e-4; c.layer_lr_decay = 0.8; c.max_length = 128
@@ -79,13 +80,13 @@ elif c.size == 'large': c.lr = 5e-5; c.layer_lr_decay = 0.9; c.max_length = 512
 else: raise ValueError(f"Invalid size {c.size}")
 if c.pretrained_checkpoint is None: c.max_length = 512 # All public models is ++, which use max_length 512
 
-# wsc
-if c.wsc_trick:
-  from _utils.wsc_trick import * # importing spacy model takes time
-
 # huggingface/transformers
 hf_tokenizer = ElectraTokenizerFast.from_pretrained(f"google/electra-{c.size}-discriminator")
 electra_config = ElectraConfig.from_pretrained(f'google/electra-{c.size}-discriminator')
+
+# wsc
+if c.wsc_trick:
+  from _utils.wsc_trick import * # importing spacy model takes time
 
 # neptune (logging)
 if c.group_name is not False and c.do_finetune:
@@ -95,7 +96,7 @@ if c.group_name is not False and c.do_finetune:
     def after_batch(self): pass
     def after_epoch(self):
       if self.epoch == (self.n_epoch - 1): super().after_epoch()
-  neptune.init(project_qualified_name='richard-wang/electra-glue')
+  neptune.init(project_qualified_name='richard-wang/electra-glue') # change here to your neptune project name
 
 # my model
 if c.my_model:
@@ -203,8 +204,9 @@ for task in ['cola', 'sst2', 'mrpc', 'qqp', 'stsb', 'mnli', 'qnli', 'rte', 'wnli
   if c.double_unordered and task in ['mrpc', 'stsb']:
     dl_kwargs = {'train': {'cache_name': f"double_dl_{c.max_length}_train.json"}}
   else: dl_kwargs = None
-  glue_dls[task] = hf_dsets.dataloaders(bs=32, cache_name=f"dl_{c.max_length}_{{split}}.json"
-                                        ,dl_kwargs=dl_kwargs)
+  glue_dls[task] = hf_dsets.dataloaders(bs=32, shuffle_train=True, 
+                                        cache_name=f"dl_{c.max_length}_{{split}}.json",
+                                        dl_kwargs=dl_kwargs,)
 
 
 # %%
@@ -278,77 +280,20 @@ if False:
 # * Note that we should use different prediction head instance for different tasks.
 
 # %%
-@torch.no_grad()
-def bert_reinit(module):
-  """ Initialize the weights """
-  if isinstance(module, (nn.Linear, nn.Embedding)):
-    # Slightly different from the TF version which uses truncated_normal for initialization
-    # cf https://github.com/pytorch/pytorch/pull/5617
-    module.weight.data.normal_(mean=0.0, std=0.02)
-  elif isinstance(module, nn.LayerNorm):
-    module.bias.data.zero_()
-    module.weight.data.fill_(1.0)
-  if isinstance(module, nn.Linear) and module.bias is not None:
-    module.bias.data.zero_()
-
-@torch.no_grad()
-def xavier_reinit(module):
-  """ Initialize the weights """
-  if isinstance(module, nn.Linear):
-    nn.init.xavier_uniform_(module.weight.data)
-  if isinstance(module, nn.Linear) and module.bias is not None:
-    module.bias.data.zero_()
-
-
-# %%
-class ElectraClassificationHead(nn.Module):
-    """Head for sentence-level classification tasks."""
-
-    def __init__(self, config, num_labels, act, first_drop=True):
-        super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
-        self.act = act
-        self.first_drop = first_drop
-
-    def forward(self, x, **kwargs):
-        if self.first_drop: x = self.dropout(x)
-        x = self.dense(x)
-        x = self.act(x)
-        x = self.dropout(x)
-        x = self.out_proj(x)
-        return x
-
-
-# %%
 class SentencePredictor(nn.Module):
+
   def __init__(self, model, hidden_size, num_class):
     super().__init__()
     self.base_model = model
     self.dropout = nn.Dropout(0.1)
-
-    if c.classifier_type == 'electra':
-      self.dropout = nn.Dropout(0.1)
-      self.classifier = nn.Linear(hidden_size, num_class)
-    elif c.classifier_type.startswith('hf'):
-      if c.classifier_type.endswith('gelu'): act = nn.functional.gelu
-      else: act = torch.tanh
-      self.classifier = ElectraClassificationHead(electra_config, num_class, act)
-    elif c.classifier_type == 'funnel':
-      self.classifier = ElectraClassificationHead(electra_config, num_class, torch.tanh, False)
-
-    if c.reinit_outlayer == 'bert':
-      self.classifier.apply(bert_reinit)
-    elif c.reinit_outlayer == 'xavier':
-      self.classifier.apply(xavier_reinit)
+    self.classifier = nn.Linear(hidden_size, num_class)
+    if c.xavier_reinited_outlayer:
+      nn.init.xavier_uniform_(self.classifier.weight.data)
+      self.classifier.bias.data.zero_()
 
   def forward(self, input_ids, attention_mask, token_type_ids):
     x = self.base_model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)[0]
-    if c.classifier_type == 'electra':
-      return self.classifier(self.dropout(x[:,0,:])).squeeze(-1).float()
-    else:
-      return self.classifier(x[:,0,:]).squeeze(-1).float() # if regression task, squeeze to (B), else (B,#class)
+    return self.classifier(self.dropout(x[:,0,:])).squeeze(-1) # if regression task, squeeze to (B), else (B,#class)
 
 # %% [markdown]
 # ## 2.2 Discriminative learning rate
@@ -419,8 +364,8 @@ def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
                             num_hidden_layers=electra_config.num_hidden_layers,)
   
   # Optimizer
-  if c.adam_bias_correction: opt_func = partial(Adam, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=c.wd)
-  else: opt_func = partial(Adam_no_bias_correction, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=c.wd)
+  if c.adam_bias_correction: opt_func = partial(Adam, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=0.01)
+  else: opt_func = partial(Adam_no_bias_correction, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=0.01)
   
   # Learner
   learn = Learner(dls, model,
@@ -436,13 +381,8 @@ def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
   if isinstance(c.device, list) or c.device is None:
     learn.model = nn.DataParallel(learn.model, device_ids=c.device)
 
-  # Mixed precision and Gradient clip
-  if c.mixed_precision == 'fastai':
-    if c.clip_gradient: learn.to_fp16(max_loss_scale=2.**15, clip=1.0)
-    else: learn.to_fp16(max_loss_scale=2.**15)
-  else:
-    if c.mixed_precision == 'native': learn.to_native_fp16(init_scale=2.**14)
-    if c.clip_gradient: learn.add_cb(GradientClipping(1.0))
+  # Gradient clip
+  learn.add_cb(GradientClipping(1.0))
 
   # Logging
   if run_name and not inference:
@@ -450,7 +390,7 @@ def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
     learn.add_cb(SimplerNeptuneCallback(False))
 
   # Learning rate schedule
-  if one_cycle: return learn, partial(learn.fit_one_cycle, n_epoch=num_epochs)
+  if one_cycle: return learn, partial(learn.fit_one_cycle, n_epoch=num_epochs, pct_start=0.1) # TODO
   else:
     lr_shedule = ParamScheduler({'lr': partial(linear_warmup_and_then_decay if c.separate_lr else linear_warmup_and_decay,
                                              lr_max=np.array(layer_lrs),
@@ -465,11 +405,11 @@ def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
 if c.do_finetune:
   for i in range(c.start, c.end):
     for task in ['cola', 'sst2', 'mrpc', 'stsb', 'qnli', 'rte', 'qqp', 'mnli', 'wnli']:
-      if task != 'wnli': continue # to only do some tasks
-      if c.group_name: run_name = f"{c.group_name}_{task}_{i}"
+      if c.group_name: run_name = f"{c.group_name}_{task}_{i}";
       else: run_name = None; print(task)
       learn, fit_fc = get_glue_learner(task, run_name)
       if c.seeds:
+        torch.backends.cudnn.benchmark = False
         random.seed(c.seeds[i])
         np.random.seed(c.seeds[i])
         torch.manual_seed(c.seeds[i])
@@ -480,7 +420,17 @@ if c.do_finetune:
 # # 3. Testing
 
 # %%
+# Haven't find way to validate and log tow datasets in the training loop, so validate mnli-mm here as a workaround
+if not c.do_finetune:
+  learn, _ = get_glue_learner('mnli', inference=True)
+  learn.load(f"{c.group_name}_mnli_{c.th_run['mnli']}")
+  with learn.no_mbar():
+    print(learn.validate(ds_idx=2))
+
+
+# %%
 def get_identifier(task, split):
+  "Turn task name to official task identifier defined."
   map = {'cola': 'CoLA', 'sst2':'SST-2', 'mrpc':'MRPC', 'qqp':'QQP', 'stsb':'STS-B', 'qnli':'QNLI', 'rte':'RTE', 'wnli':'WNLI', 'ax':'AX'}
   if task =='mnli' and split == 'test_matched': return 'MNLI-m'
   elif task == 'mnli' and split == 'test_mismatched': return 'MNLI-mm'
@@ -493,7 +443,7 @@ def predict_test(task, checkpoint, dl_idx):
 
   # Load checkpoint and get predictions
   learn, _ = get_glue_learner(task, inference=True)
-  if task == 'wnli' and config['wsc_trick']:
+  if task == 'wnli' and c.wsc_trick:
     load_model_(learn, checkpoint, merge_out_fc=wsc_trick_merge)
   else:
     load_model_(learn, checkpoint)
@@ -511,7 +461,7 @@ def predict_test(task, checkpoint, dl_idx):
     
   # Form test dataframe and save
   test_df = pd.DataFrame( {'index':range(len(list(glue_dsets[task].values())[dl_idx])), 'prediction': preds} )
-  split = list(glue_dsets['mnli'].keys())[dl_idx]
+  split = list(glue_dsets['mnli'].keys())[dl_idx] if task == 'mnli' else 'test'
   identifier = get_identifier(task, split)
   test_df.to_csv( output_dir/f'{identifier}.tsv', sep='\t' )
   return test_df
@@ -520,7 +470,6 @@ def predict_test(task, checkpoint, dl_idx):
 # %%
 if not c.do_finetune:
   for task, th in c.th_run.items():
-    if task in ['wnli']: continue # to do only some task
     print(task)
     # ax use mnli ckp
     if isinstance(th, int):
@@ -531,5 +480,9 @@ if not c.do_finetune:
     dl_idxs = [-1, -2] if task=='mnli' else [-1]
     for dl_idx in dl_idxs:
       df = predict_test(task, ckp, dl_idx)
+
+
+# %%
+
 
 
