@@ -13,7 +13,7 @@ from torch import nn
 import nlp
 from transformers import ElectraModel, ElectraConfig, ElectraTokenizerFast, ElectraForPreTraining
 from transformers.modeling_electra import ElectraClassificationHead
-from fastai2.text.all import *
+from fastai.text.all import *
 from hugdatafast import *
 from _utils.utils import *
 from _utils.would_like_to_pr import *
@@ -24,37 +24,49 @@ from _utils.would_like_to_pr import *
 # %%
 c = MyConfig({
   'device': 'cuda:1', #List[int]: use multi gpu (data parallel)
-  'start':9,
+  'start':0,
   'end': 10,
   
-  'pretrained_checkpoint': 'native_clip_1188_12.5%.pth', # None to downalod model from HuggingFace
+  'pretrained_checkpoint': 'native_clip_1188_100.0%.pth',#'native_clip_1188_100.0%.pth', # None to downalod model from HuggingFace
+  # i th run across tasks use i th seeds, None to use system time
+  #'seeds': [939, 481, 569, 620, 159, 808, 816, 101, 554, 104], # for 11081
+  #'seeds': [611, 609, 830, 237, 668, 608, 475, 690, 53, 94], # for 36
+  'seeds': [775, 961, 778, 915, 979, 526, 99, 669, 806, 78], # for 1188
+  #'seeds': [895, 602, 573, 457, 736, 871, 571, 84, 514, 740,], # for 76
+  'seeds': [760, 63, 392, 240, 794, 168, 245, 345, 97, 917], # 1
   'my_model': True,
 
   'adam_bias_correction': False,
-  'mixed_precision': 'native',
+  'mixed_precision': False,
   'clip_gradient': True,
   'wd': 0.01,
-  'group_name': 'native_clip_1188_12.5%_ncw', 
+
+  'classifier_type': 'electra',
+  'reinit_outlayer': 'xavier',
+  # the name of represents these runs
+  'group_name': 'native_clip_1188_100.0%__cwex',#'native_clip_1188_100.0%_ncw',
+  # None: use name of checkpoint.
+  # False: don't do online logging and don't save checkpoints
   
+  'separate_lr': False,
   'size': 'small',
   'wsc_trick': False,
+  'double_unordered': True,
+  'original_lr_layer_decays': True,
 
   # whether to do finetune or test
   'do_finetune': True, # True -> do finetune ; False -> do test
   # finetuning checkpoint for testing. These will become "ckp_dir/{task}_{group_name}_{th_run}.pth"
-  'th_run': {'cola': 7, 'sst2': 8, 'mrpc': 8, 'qqp': 44, 'stsb': 4, 'qnli': 0, 'rte': 7, 'mnli': 48, 'ax': 48,
+  'th_run': {'cola': 43, 'sst2': 8, 'mrpc': 6, 'qqp': 5, 'stsb': 3, 'qnli': 8, 'rte': 6, 'mnli': 1, 'ax': 1,
              'wnli': [22,3,10,14,8,0,17,20,2,6], 
              },
-  
-  # i th run across tasks use i th seeds
-  'seeds': [989, 499, 628, 521, 327, 175, 578, 89, 209, 627, 404, 374, 413, 555, 70, 308, 990, 127, 721, 345, 718, 485, 813, 396, 878, 283, 430, 383, 322, 933, 895, 602, 573, 457, 736, 871, 571, 84, 514, 740, 696, 576, 313, 399, 451, 952, 417, 858, 461, 610], # None to use system time
-  
-  # the name of represents these runs
-  
-  # None: use name of checkpoint.
-  # False: don't do online logging and don't save checkpoints
 })
 
+assert c.classifier_type in ['electra', 'hf_gelu', 'hf_tanh','funnel']
+assert c.reinit_outlayer in ['xavier', 'bert', 'kaiming']
+
+
+# %%
 # Check
 if not c.do_finetune: assert c.th_run['mnli'] == c.th_run['ax']
 assert c.mixed_precision in [False, 'fastai', 'native']
@@ -78,7 +90,7 @@ electra_config = ElectraConfig.from_pretrained(f'google/electra-{c.size}-discrim
 # neptune (logging)
 if c.group_name is not False and c.do_finetune:
   import neptune
-  from fastai2.callback.neptune import NeptuneCallback
+  from fastai.callback.neptune import NeptuneCallback
   class SimplerNeptuneCallback(NeptuneCallback):
     def after_batch(self): pass
     def after_epoch(self):
@@ -95,6 +107,7 @@ if c.my_model:
 # Path
 Path('./datasets').mkdir(exist_ok=True)
 Path('./checkpoints/glue').mkdir(exist_ok=True, parents=True)
+Path('./test_outputs/glue').mkdir(exist_ok=True, parents=True)
 c.pretrained_ckp_path = Path(f'./checkpoints/pretrain/{c.pretrained_checkpoint}')
 if c.group_name is None: c.group_name = c.pretrained_checkpoint[:-4]
 
@@ -123,7 +136,7 @@ TEXT_COLS = {
     **{ task:['sentence'] for task in ['cola','sst2']},
 }
 LOSS_FUNC = {
-    **{ task: CrossEntropyLossFlat() for task in ['cola','sst2','mrpc','qqp','mnli','qnli','rte','wnli']},
+    **{ task: CrossEntropyLossFlat() for task in ['cola','sst2','mrpc','qqp','mnli','qnli','rte','wnli', 'ax']},
     **{ task: MyMSELossFlat(low=0.0, high=5.0) for task in ['stsb']}
 }
 if c.wsc_trick: 
@@ -137,7 +150,7 @@ if c.wsc_trick:
 # ## 2.1 Download and Preprocess
 
 # %%
-def tokenize_sents_max_len(example, cols, max_length):
+def tokenize_sents_max_len(example, cols, max_length, swap=False):
   # Follow BERT and ELECTRA, truncate the examples longer than max length
   tokens_a = hf_tokenizer.tokenize(example[cols[0]])
   tokens_b = hf_tokenizer.tokenize(example[cols[1]]) if len(cols)==2 else []
@@ -150,6 +163,8 @@ def tokenize_sents_max_len(example, cols, max_length):
       tokens_a.pop()
     else:
       tokens_b.pop()
+  if swap:
+    tokens_a, tokens_b = tokens_b, tokens_a
   tokens = [hf_tokenizer.cls_token, *tokens_a, hf_tokenizer.sep_token]
   token_type = [0]*len(tokens)
   if tokens_b: 
@@ -176,10 +191,20 @@ for task in ['cola', 'sst2', 'mrpc', 'qqp', 'stsb', 'mnli', 'qnli', 'rte', 'wnli
   tok_func = partial(tokenize_sents_max_len, cols=TEXT_COLS[task], max_length=c.max_length)
   glue_dsets[task] = HF_Transform(dsets, func=tok_func).map(cache_name=f"tokenized_{c.max_length}_{{split}}.arrow")
 
+  if c.double_unordered and task in ['mrpc', 'stsb']:
+    swap_tok_func = partial(tokenize_sents_max_len, cols=TEXT_COLS[task], max_length=c.max_length, swap=True)
+    tfm = HF_Transform(dsets['train'], func=swap_tok_func)
+    swapped_train = tfm.map(cache_name=f"swapped_tokenized_{c.max_length}_train.arrow")
+    glue_dsets[task]['train'] = HF_MergedDataset(glue_dsets[task]['train'], swapped_train)
+
   # Load / Make dataloaders
   hf_dsets = HF_Datasets(glue_dsets[task], hf_toker=hf_tokenizer, n_inp=3,
                 cols={'inp_ids':TensorText, 'attn_mask':noop, 'token_type_ids':noop, 'label':TensorCategory})
-  glue_dls[task] = hf_dsets.dataloaders(bs=32, cache_name=f"dl_{c.max_length}_{{split}}.json")
+  if c.double_unordered and task in ['mrpc', 'stsb']:
+    dl_kwargs = {'train': {'cache_name': f"double_dl_{c.max_length}_train.json"}}
+  else: dl_kwargs = None
+  glue_dls[task] = hf_dsets.dataloaders(bs=32, cache_name=f"dl_{c.max_length}_{{split}}.json"
+                                        ,dl_kwargs=dl_kwargs)
 
 
 # %%
@@ -253,15 +278,77 @@ if False:
 # * Note that we should use different prediction head instance for different tasks.
 
 # %%
+@torch.no_grad()
+def bert_reinit(module):
+  """ Initialize the weights """
+  if isinstance(module, (nn.Linear, nn.Embedding)):
+    # Slightly different from the TF version which uses truncated_normal for initialization
+    # cf https://github.com/pytorch/pytorch/pull/5617
+    module.weight.data.normal_(mean=0.0, std=0.02)
+  elif isinstance(module, nn.LayerNorm):
+    module.bias.data.zero_()
+    module.weight.data.fill_(1.0)
+  if isinstance(module, nn.Linear) and module.bias is not None:
+    module.bias.data.zero_()
+
+@torch.no_grad()
+def xavier_reinit(module):
+  """ Initialize the weights """
+  if isinstance(module, nn.Linear):
+    nn.init.xavier_uniform_(module.weight.data)
+  if isinstance(module, nn.Linear) and module.bias is not None:
+    module.bias.data.zero_()
+
+
+# %%
+class ElectraClassificationHead(nn.Module):
+    """Head for sentence-level classification tasks."""
+
+    def __init__(self, config, num_labels, act, first_drop=True):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
+        self.act = act
+        self.first_drop = first_drop
+
+    def forward(self, x, **kwargs):
+        if self.first_drop: x = self.dropout(x)
+        x = self.dense(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.out_proj(x)
+        return x
+
+
+# %%
 class SentencePredictor(nn.Module):
   def __init__(self, model, hidden_size, num_class):
     super().__init__()
     self.base_model = model
     self.dropout = nn.Dropout(0.1)
-    self.classifier = nn.Linear(hidden_size, num_class)
+
+    if c.classifier_type == 'electra':
+      self.dropout = nn.Dropout(0.1)
+      self.classifier = nn.Linear(hidden_size, num_class)
+    elif c.classifier_type.startswith('hf'):
+      if c.classifier_type.endswith('gelu'): act = nn.functional.gelu
+      else: act = torch.tanh
+      self.classifier = ElectraClassificationHead(electra_config, num_class, act)
+    elif c.classifier_type == 'funnel':
+      self.classifier = ElectraClassificationHead(electra_config, num_class, torch.tanh, False)
+
+    if c.reinit_outlayer == 'bert':
+      self.classifier.apply(bert_reinit)
+    elif c.reinit_outlayer == 'xavier':
+      self.classifier.apply(xavier_reinit)
+
   def forward(self, input_ids, attention_mask, token_type_ids):
     x = self.base_model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)[0]
-    return self.classifier(self.dropout(x[:,0])).squeeze(-1).float() # if regression task, squeeze to (B), else (B,#class)
+    if c.classifier_type == 'electra':
+      return self.classifier(self.dropout(x[:,0,:])).squeeze(-1).float()
+    else:
+      return self.classifier(x[:,0,:]).squeeze(-1).float() # if regression task, squeeze to (B), else (B,#class)
 
 # %% [markdown]
 # ## 2.2 Discriminative learning rate
@@ -276,7 +363,7 @@ def hf_electra_param_splitter(model, wsc_trick=False):
   scaler_name = 'dimension_scaler' if c.my_model else 'embeddings_project'
   layers_name = 'layers' if c.my_model else 'layer'
   output_name = 'classifier' if not wsc_trick else f'discriminator.discriminator_predictions'
-
+  
   groups = [ list_parameters(model, f"{base}.{embed_name}") ]
   for i in range(electra_config.num_hidden_layers):
     groups.append( list_parameters(model, f"{base}.encoder.{layers_name}[{i}]") )
@@ -287,20 +374,23 @@ def hf_electra_param_splitter(model, wsc_trick=False):
     groups[-1] += list_parameters(model, f"{base}.encoder.norm")
 
   assert len(list(model.parameters())) == sum([ len(g) for g in groups])
+  for p1, p2 in zip(model.parameters(), [ p for g in groups for p in g]):  assert torch.equal(p1, p2)
   return groups
 
-def get_layer_lrs(lr, decay_rate_of_depth, num_hidden_layers):
-  # I think input layer as bottom and output layer as top, which make 'depth' mean different from the one of official repo
-  return [ lr * (decay_rate_of_depth ** depth) for depth in reversed(range(num_hidden_layers+2))]
+def get_layer_lrs(lr, decay_rate, num_hidden_layers):
+  lrs = [ lr * (decay_rate ** depth) for depth in range(num_hidden_layers+2)]
+  if c.original_lr_layer_decays:
+    for i in range(1, len(lrs)): lrs[i] *= decay_rate
+  return list(reversed(lrs))
 
 # %% [markdown]
 # ## 2.3 learner
 
 # %%
 def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
-  
+
   # Num_epochs
-  if task == 'rte': num_epochs = 10
+  if task in ['rte', 'stsb']: num_epochs = 10
   else: num_epochs = 3
 
   # Dataloaders
@@ -325,9 +415,9 @@ def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
   # Discriminative learning rates
   splitter = partial( hf_electra_param_splitter, wsc_trick=(task=='wnli' and c.wsc_trick) )
   layer_lrs = get_layer_lrs(lr=c.lr, 
-                            decay_rate_of_depth=c.layer_lr_decay,
+                            decay_rate=c.layer_lr_decay,
                             num_hidden_layers=electra_config.num_hidden_layers,)
-
+  
   # Optimizer
   if c.adam_bias_correction: opt_func = partial(Adam, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=c.wd)
   else: opt_func = partial(Adam_no_bias_correction, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=c.wd)
@@ -355,14 +445,14 @@ def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
     if c.clip_gradient: learn.add_cb(GradientClipping(1.0))
 
   # Logging
-  if run_name:
+  if run_name and not inference:
     neptune.create_experiment(name=run_name, params={'task':task, **c})
     learn.add_cb(SimplerNeptuneCallback(False))
 
   # Learning rate schedule
   if one_cycle: return learn, partial(learn.fit_one_cycle, n_epoch=num_epochs)
   else:
-    lr_shedule = ParamScheduler({'lr': partial(linear_warmup_and_decay,
+    lr_shedule = ParamScheduler({'lr': partial(linear_warmup_and_then_decay if c.separate_lr else linear_warmup_and_decay,
                                              lr_max=np.array(layer_lrs),
                                              warmup_pct=0.1,
                                              total_steps=num_epochs*(len(dls.train)))})
@@ -375,8 +465,8 @@ def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
 if c.do_finetune:
   for i in range(c.start, c.end):
     for task in ['cola', 'sst2', 'mrpc', 'stsb', 'qnli', 'rte', 'qqp', 'mnli', 'wnli']:
-      if task in ['wnli']: continue # to only do some tasks
-      if c.group_name: run_name = f"{c.group_name}_{task}_{i}";
+      if task != 'wnli': continue # to only do some tasks
+      if c.group_name: run_name = f"{c.group_name}_{task}_{i}"
       else: run_name = None; print(task)
       learn, fit_fc = get_glue_learner(task, run_name)
       if c.seeds:
@@ -396,8 +486,8 @@ def get_identifier(task, split):
   elif task == 'mnli' and split == 'test_mismatched': return 'MNLI-mm'
   else: return map[task]
 
-def predict_test(task, checkpoint, dl_idx, output_dir):
-  output_dir = Path(output_dir)
+def predict_test(task, checkpoint, dl_idx):
+  output_dir = Path(f'./test_outputs/glue/{c.group_name}')
   output_dir.mkdir(exist_ok=True)
   device = torch.device(c.device)
 
@@ -407,7 +497,7 @@ def predict_test(task, checkpoint, dl_idx, output_dir):
     load_model_(learn, checkpoint, merge_out_fc=wsc_trick_merge)
   else:
     load_model_(learn, checkpoint)
-  results = learn.get_preds(ds_idx=dl_idx, with_decoded=True)
+  results = learn.get_preds(dl=learn.dls[dl_idx], with_decoded=True)
   preds = results[-1] # preds -> (predictions logits, targets, decoded prediction)
 
   # Decode target class index to its class name 
@@ -440,6 +530,6 @@ if not c.do_finetune:
     # run test for all testset in this task
     dl_idxs = [-1, -2] if task=='mnli' else [-1]
     for dl_idx in dl_idxs:
-      df = predict_test(task, ckp, dl_idx, output_dir=f'./datasets/glue/test/{c.group_name}')
+      df = predict_test(task, ckp, dl_idx)
 
 

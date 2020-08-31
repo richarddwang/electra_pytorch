@@ -2,7 +2,7 @@ import time
 from statistics import mean, stdev
 import torch
 from torch import nn
-from fastai2.text.all import *
+from fastai.text.all import *
 
 """
 I would like more uniform way to pass the metrics, no matter loss_func or metric,

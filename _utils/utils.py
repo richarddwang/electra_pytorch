@@ -1,5 +1,5 @@
 from functools import partial
-from fastai2.text.all import *
+from fastai.text.all import *
 from hugdatafast.transform import CombineTransform
 
 class MyConfig(dict):
@@ -33,7 +33,6 @@ def linear_warmup_and_then_decay(pct, lr_max, total_steps, fake_total_steps=None
     return lr_max * min(1.0, step_i/warmup_steps)
   else: # decay
     return (lr_max-end_lr) * (1 - (step_i-warmup_steps)/(total_steps-warmup_steps)) ** decay_power + end_lr
-  return warmed_lr
 
 def load_part_model(file, model, prefix, device=None, strict=True):
   "assume `model` is part of (child attribute at any level) of model whose states save in `file`."

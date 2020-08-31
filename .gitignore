@@ -6,3 +6,4 @@
 nohup.out
 datasets/*
 checkpoints/*
+test_outputs/*

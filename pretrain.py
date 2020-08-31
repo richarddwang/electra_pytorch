@@ -23,15 +23,15 @@ from _utils.would_like_to_pr import *
 
 # %%
 c = MyConfig({
-    'device': 'cuda:3',
+    'device': 'cuda:0',
 
     'my_model': True,
-    'adam_bias_correction': False,
+    'adam_bias_correction': True,
     'mixed_precision': 'native',
     'use_clip': True,
     
-    'base_run_name': 'native_clip', # run_name = {base_run_name}_{seed}
-    'seed': 1, # 11081 36 1188 76 1 # None/False to randomly choose seed from [0,99999]
+    'base_run_name': 'plus_bc', # run_name = {base_run_name}_{seed}
+    'seed': 76, # 11081 36 1188 76 1 # None/False to randomly choose seed from [0,99999]
 
     'separate_lr_sched': False,
     'sampling': 'fp32_gumbel',
