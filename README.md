@@ -12,6 +12,7 @@ I pretrain ELECTRA-small from scratch and has successfully replicate the paper's
 |---|---|---|---|---|---|---|---|---|---|
 |ELECTRA-Small|54.6|89.1|83.7|80.3|88.0|79.7|87.7|60.8|78.0|
 |ELECTRA-Small (my)|57.2|87.1|82.1|80.4|88|78.9|87.9|63.1|78.08
+
 Results for models on the GLUE test set.
 
 # Features of this implementation
