@@ -51,9 +51,14 @@ class RunSteps(Callback):
     store_attr(self, 'n_steps,save_points,base_name,no_val')
 
   def after_batch(self):
+    # fix pct_train (cuz we'll set `n_epoch` larger than we need)
+    self.learn.pct_train -= 1./(self.n_iter*self.n_epoch)
+    self.learn.pct_train += 1./self.n_steps
+    # when to save
     if self.train_iter in self.save_points:
       percent = (self.train_iter/self.n_steps)*100
       self.learn.save(self.base_name.format(percent=f'{percent}%'))
+    # when to interrupt
     if self.train_iter == self.n_steps:
       raise CancelFitException
 

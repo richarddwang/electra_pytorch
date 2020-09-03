@@ -26,7 +26,7 @@ c = MyConfig({
   'device': 'cuda:0', #List[int]: use multi gpu (data parallel)
   # run [start,end) runs, every run finetune every GLUE tasks once with different seeds.
   'start':0,
-  'end': 10,
+  'end': 2,
   
   'pretrained_checkpoint': 'vanilla_11081_100.0%.pth', # None to downalod model from HuggingFace
   # Seeds for fintuning. i th run use i th seeds, None to use system time
@@ -38,14 +38,14 @@ c = MyConfig({
 
   'adam_bias_correction': False,
   'xavier_reinited_outlayer': True,
-  'separate_lr': False,
+  'schedule': 'original_linear',
   'original_lr_layer_decays': True,
   
   # whether to do finetune or test
-  'do_finetune': False, # True -> do finetune ; False -> do test
+  'do_finetune': True, # True -> do finetune ; False -> do test
   # finetuning checkpoint for testing. These will become "ckp_dir/{task}_{group_name}_{th_run}.pth"
-  'th_run': {'cola': 3, 'sst2': 8, 'mrpc': 4, 'qqp': 2, 'stsb': 9, 'qnli': 8, 'rte': 8, 'mnli': 4, 'ax': 4,
-             'wnli': 9, 
+  'th_run': {'cola': 7, 'sst2': 2, 'mrpc': 7, 'qqp': 4, 'stsb': 9, 'qnli': 9, 'rte': 4, 'mnli': 0, 'ax': 0,
+             'wnli': 2, 
              },
   
   'size': 'small',
@@ -59,10 +59,15 @@ c = MyConfig({
   # False: don't do online logging and don't save checkpoints
 })
 
+# only for my personal research purpose
+hparam_update = {
+  
+}
+
 """ Vanilla ELECTRA settings
 'adam_bias_correction': False,
 'xavier_reinited_outlayer': True,
-'separate_lr': False,
+'schedule': 'original_linear',
 'original_lr_layer_decays': True,
 'double_unordered': True,
 """
@@ -72,6 +77,7 @@ c = MyConfig({
 # Check
 if not c.do_finetune: assert c.th_run['mnli'] == c.th_run['ax']
 if c.pretrained_checkpoint is None: assert not c.my_model
+assert c.schedule in ['original_linear', 'separate_linear', 'one_cycle', 'adjusted_one_cycle']
 
 # Settings of different sizes
 if c.size == 'small': c.lr = 3e-4; c.layer_lr_decay = 0.8; c.max_length = 128
@@ -104,6 +110,7 @@ if c.my_model:
   from modeling.model import ModelForDiscriminator
   from hyperparameter import electra_hparam_from_hf
   hparam = electra_hparam_from_hf(electra_config, hf_tokenizer)
+  hparam.update(hparam_update)
 
 # Path
 Path('./datasets').mkdir(exist_ok=True)
@@ -151,11 +158,11 @@ if c.wsc_trick:
 # ## 2.1 Download and Preprocess
 
 # %%
-def tokenize_sents_max_len(example, cols, max_length, swap=False):
+def tokenize_sents_max_len(example, cols, max_len, swap=False):
   # Follow BERT and ELECTRA, truncate the examples longer than max length
   tokens_a = hf_tokenizer.tokenize(example[cols[0]])
   tokens_b = hf_tokenizer.tokenize(example[cols[1]]) if len(cols)==2 else []
-  _max_length = max_length - 1 - len(cols) # preserved for cls and sep tokens
+  _max_length = max_len - 1 - len(cols) # preserved for cls and sep tokens
   while True:
     total_length = len(tokens_a) + len(tokens_b)
     if total_length <= _max_length:
@@ -189,13 +196,13 @@ for task in ['cola', 'sst2', 'mrpc', 'qqp', 'stsb', 'mnli', 'qnli', 'rte', 'wnli
                                           cache_file_name='./datasets/glue/qqp/1.0.0/fixed_train.arrow')
 
   # Load / Make tokenized datasets
-  tok_func = partial(tokenize_sents_max_len, cols=TEXT_COLS[task], max_length=c.max_length)
-  glue_dsets[task] = HF_Transform(dsets, func=tok_func).map(cache_name=f"tokenized_{c.max_length}_{{split}}.arrow")
+  tok_func = partial(tokenize_sents_max_len, cols=TEXT_COLS[task], max_len=c.max_length)
+  glue_dsets[task] = dsets.my_map(tok_func, cache_file_names=f"tokenized_{c.max_length}_{{split}}")
 
   if c.double_unordered and task in ['mrpc', 'stsb']:
-    swap_tok_func = partial(tokenize_sents_max_len, cols=TEXT_COLS[task], max_length=c.max_length, swap=True)
-    tfm = HF_Transform(dsets['train'], func=swap_tok_func)
-    swapped_train = tfm.map(cache_name=f"swapped_tokenized_{c.max_length}_train.arrow")
+    swap_tok_func = partial(tokenize_sents_max_len, cols=TEXT_COLS[task], max_len=c.max_length, swap=True)
+    swapped_train = dsets['train'].my_map(swap_tok_func, 
+                                          cache_file_name=f"swapped_tokenized_{c.max_length}_train")
     glue_dsets[task]['train'] = HF_MergedDataset(glue_dsets[task]['train'], swapped_train)
 
   # Load / Make dataloaders
@@ -316,10 +323,11 @@ def hf_electra_param_splitter(model, wsc_trick=False):
   if electra_config.hidden_size != electra_config.embedding_size:
     groups[0] += list_parameters(model, f"{base}.{scaler_name}")
   if c.my_model and hparam['pre_norm']:
-    groups[-1] += list_parameters(model, f"{base}.encoder.norm")
+    groups[-1] = list_parameters(model, f"{base}.encoder.norm") + groups[-1]
 
   assert len(list(model.parameters())) == sum([ len(g) for g in groups])
-  for p1, p2 in zip(model.parameters(), [ p for g in groups for p in g]):  assert torch.equal(p1, p2)
+  for i, (p1, p2) in enumerate(zip(model.parameters(), [ p for g in groups for p in g])):
+    assert torch.equal(p1, p2), f"The {i} th tensor"
   return groups
 
 def get_layer_lrs(lr, decay_rate, num_hidden_layers):
@@ -332,7 +340,7 @@ def get_layer_lrs(lr, decay_rate, num_hidden_layers):
 # ## 2.3 learner
 
 # %%
-def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
+def get_glue_learner(task, run_name=None, inference=False):
 
   # Num_epochs
   if task in ['rte', 'stsb']: num_epochs = 10
@@ -386,16 +394,20 @@ def get_glue_learner(task, run_name=None, one_cycle=False, inference=False):
 
   # Logging
   if run_name and not inference:
-    neptune.create_experiment(name=run_name, params={'task':task, **c})
+    neptune.create_experiment(name=run_name, params={'task':task, **c, **hparam_update})
     learn.add_cb(SimplerNeptuneCallback(False))
 
   # Learning rate schedule
-  if one_cycle: return learn, partial(learn.fit_one_cycle, n_epoch=num_epochs, pct_start=0.1) # TODO
+  if c.schedule == 'one_cycle': 
+    return learn, partial(learn.fit_one_cycle, n_epoch=num_epochs, lr_max=layer_lrs)
+  elif c.schedule == 'adjusted_one_cycle':
+    return learn, partial(learn.fit_one_cycle, n_epoch=num_epochs, lr_max=layer_lrs, div=1e5, pct_start=0.1)
   else:
-    lr_shedule = ParamScheduler({'lr': partial(linear_warmup_and_then_decay if c.separate_lr else linear_warmup_and_decay,
-                                             lr_max=np.array(layer_lrs),
-                                             warmup_pct=0.1,
-                                             total_steps=num_epochs*(len(dls.train)))})
+    lr_shed_func = linear_warmup_and_then_decay if c.schedule=='separate_linear' else linear_warmup_and_decay
+    lr_shedule = ParamScheduler({'lr': partial(lr_shed_func,
+                                               lr_max=np.array(layer_lrs),
+                                               warmup_pct=0.1,
+                                               total_steps=num_epochs*(len(dls.train)))})
     return learn, partial(learn.fit, n_epoch=num_epochs, cbs=[lr_shedule])
 
 # %% [markdown]
@@ -480,9 +492,5 @@ if not c.do_finetune:
     dl_idxs = [-1, -2] if task=='mnli' else [-1]
     for dl_idx in dl_idxs:
       df = predict_test(task, ckp, dl_idx)
-
-
-# %%
-
 
 

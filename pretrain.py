@@ -23,13 +23,13 @@ from _utils.would_like_to_pr import *
 
 # %%
 c = MyConfig({
-    'device': 'cuda:3',
+    'device': 'cuda:0',
     
     'base_run_name': 'vanilla', # run_name = {base_run_name}_{seed}
     'seed': 11081, # 11081 36 1188 76 1 # None/False to randomly choose seed from [0,99999]
 
-    'adam_bias_correction': False,
-    'separate_lr_sched': False,
+    'adam_bias_correction': True,
+    'schedule': 'original_linear',
     'sampling': 'fp32_gumbel',
     'electra_mask_style': True,
     'tie_gen_in_out_embedding': False,
@@ -37,12 +37,15 @@ c = MyConfig({
     'disc_smooth_label': False,
 
     'size': 'small',
-    'my_model': False, # False to indicate using hf model
+    'my_model': False, # False to use huggingface model architecture (untrained weights)
 })
+
+# only for my personal research purpose
+hparam_update = {}
 
 """ Vanilla ELECTRA settings
 'adam_bias_correction': False,
-'separate_lr_sched': False,
+'schedule': 'original_linear',
 'sampling': 'fp32_gumbel',
 'electra_mask_style': True,
 'tie_gen_in_out_embedding': False,
@@ -53,8 +56,8 @@ c = MyConfig({
 
 # %%
 # Check and Default
-assert c.mixed_precision in [False, 'fastai', 'native']
 assert c.sampling in ['fp32_gumbel', 'fp16_gumbel', 'multinomial']
+assert c.schedule in ['original_linear', 'separate_linear', 'one_cycle', 'adjusted_one_cycle']
 if not c.base_run_name: c.base_run_name = str(datetime.now(timezone(timedelta(hours=+8))))[6:-13].replace(' ','').replace(':','').replace('-','')
 if not c.seed: c.seed = random.randint(0, 99999)
 c.run_name = f'{c.base_run_name}_{c.seed}'
@@ -89,6 +92,7 @@ if c.size in ['small', 'base']:
 # Print info
 print(f"process id: {os.getpid()}")
 print(c)
+print(hparam_update)
 
 
 # %%
@@ -97,7 +101,9 @@ if c.my_model:
   from modeling.model import ModelForGenerator,ModelForDiscriminator
   from hyperparameter import electra_hparam_from_hf
   gen_hparam = electra_hparam_from_hf(gen_config, hf_tokenizer)
+  gen_hparam.update(hparam_update)
   disc_hparam = electra_hparam_from_hf(disc_config, hf_tokenizer)
+  disc_hparam.update(hparam_update)
 
 # %% [markdown]
 # # 1. Load Data
@@ -129,7 +135,7 @@ if c.size in ['small', 'base']:
 
   wb_data = HF_MergedDataset(wiki, book)
   wb_dsets = HF_Datasets({'train': wb_data}, cols=['input_ids','sentA_lenth'], hf_toker=hf_tokenizer, n_inp=2)
-  dls = wb_dsets.dataloaders(bs=c.bs,
+  dls = wb_dsets.dataloaders(bs=c.bs, num_workers=3,
                              shuffle_train=True,
                              srtkey_fc=False, 
                              cache_dir='./datasets/wikibook_dl', cache_name='dl_{split}.json')
@@ -288,7 +294,7 @@ class ELECTRAModel(nn.Module):
 
     disc_logits = self.discriminator(generated, attention_mask, token_type_ids)[0] # (B, L)
 
-    return mlm_gen_logits, generated, disc_logits, is_replaced, attention_mask.bool(), is_mlm_applied
+    return mlm_gen_logits, generated, disc_logits, is_replaced, attention_mask, is_mlm_applied
 
   def _get_pad_mask_and_token_type(self, input_ids, sentA_lenths):
     """
@@ -353,17 +359,23 @@ else:
 electra_model = ELECTRAModel(generator, discriminator, hf_tokenizer)
 electra_loss_func = ELECTRALoss(gen_label_smooth=c.gen_smooth_label, disc_label_smooth=c.disc_smooth_label)
 
+# jit (Haven't fiqured out how to make it work)
+# input_ids, sentA_lenths = dls.one_batch()
+# masked_inputs, labels, is_mlm_applied = mlm_cb.mask_tokens(input_ids)
+# electra_jit_model = torch.jit.trace(electra_model, (masked_inputs, sentA_lenths, is_mlm_applied, labels))
+
 # Optimizer
 if c.adam_bias_correction: opt_func = partial(Adam, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=0.01)
 else: opt_func = partial(Adam_no_bias_correction, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=0.01)
 
 # Learning rate shedule
-lr_shed_func = linear_warmup_and_then_decay if c.separate_lr_sched else linear_warmup_and_decay
-lr_shedule = ParamScheduler({'lr': partial(linear_warmup_and_decay,
-                                           lr_max=c.lr,
-                                           warmup_steps=10000,
-                                           total_steps=c.steps,
-                                           fake_total_steps=len(dls[0])*9999)})
+if c.schedule.endswith('linear'):
+  lr_shed_func = linear_warmup_and_then_decay if c.schedule=='separate_linear' else linear_warmup_and_decay
+  lr_shedule = ParamScheduler({'lr': partial(linear_warmup_and_decay,
+                                             lr_max=c.lr,
+                                             warmup_steps=10000,
+                                             total_steps=c.steps,)})
+
 
 # Learner
 dls.to(torch.device(c.device))
@@ -373,8 +385,8 @@ learn = Learner(dls, electra_model,
                 path='./checkpoints',
                 model_dir='pretrain',
                 cbs=[mlm_cb,
-                    RunSteps(c.steps, [0.0625, 0.125, 0.25, 0.5, 1.0], c.run_name+"_{percent}"),
-                    ],
+                     RunSteps(c.steps, [0.0625, 0.125, 0.25, 0.5, 1.0], c.run_name+"_{percent}"),
+                     ],
                 )
 
 # Mixed precison and Gradient clip
@@ -390,6 +402,8 @@ torch.manual_seed(c.seed)
 # Run 
 print(f"{c.run_name} , starts at {datetime.now(timezone(timedelta(hours=+8)))}")
 #bk()
-learn.fit(9999, cbs=[lr_shedule])
+if c.schedule == 'one_cycle': learn.fit_one_cycle(9999, lr_max=c.lr)
+elif c.schedule == 'adjusted_one_cycle': learn.fit_one_cycle(9999, lr_max=c.lr, div=1e5, pct_start=10000/c.steps)
+else: learn.fit(9999, cbs=[lr_shedule])
 
 
