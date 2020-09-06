@@ -11,8 +11,8 @@ import numpy as np
 import torch
 from torch import nn
 import nlp
-from transformers import ElectraModel, ElectraConfig, ElectraTokenizerFast, ElectraForPreTraining
 from fastai.text.all import *
+from transformers import ElectraModel, ElectraConfig, ElectraTokenizerFast, ElectraForPreTraining
 from hugdatafast import *
 from _utils.utils import *
 from _utils.would_like_to_pr import *

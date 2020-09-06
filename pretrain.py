@@ -12,8 +12,8 @@ from torch import nn
 import torch.nn.functional as F
 import torch.tensor as T
 import nlp
-from transformers import ElectraConfig, ElectraTokenizerFast, ElectraForMaskedLM, ElectraForPreTraining
 from fastai.text.all import *
+from transformers import ElectraConfig, ElectraTokenizerFast, ElectraForMaskedLM, ElectraForPreTraining
 from hugdatafast import *
 from _utils.utils import *
 from _utils.would_like_to_pr import *

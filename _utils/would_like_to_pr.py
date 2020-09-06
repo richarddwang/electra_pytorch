@@ -48,7 +48,7 @@ class RunSteps(Callback):
       save_points = [ s if isinstance(s,int) else int(n_steps*s) for s in save_points ]
       for sp in save_points: assert sp != 1, "Are you sure you want to save after 1 steps, instead of 1.0 * num_steps ?"
       assert max(save_points) <= n_steps
-    store_attr(self, 'n_steps,save_points,base_name,no_val')
+    store_attr('n_steps,save_points,base_name,no_val', self)
 
   def after_batch(self):
     # fix pct_train (cuz we'll set `n_epoch` larger than we need)
@@ -92,7 +92,7 @@ class Timer(RunSteps):
     """
     steps = ignore_first_n + n_steps
     super().__init__(steps, **kwargs)
-    store_attr(self, 'steps,break_after,ignore_first_n,precision')
+    store_attr('steps,break_after,ignore_first_n,precision', self)
 
   def time_delta(self): 
     delta = time.time() - self.timepoint
