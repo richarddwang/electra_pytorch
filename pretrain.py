@@ -28,7 +28,7 @@ c = MyConfig({
     'base_run_name': 'vanilla', # run_name = {base_run_name}_{seed}
     'seed': 11081, # 11081 36 1188 76 1 # None/False to randomly choose seed from [0,99999]
 
-    'adam_bias_correction': True,
+    'adam_bias_correction': False,
     'schedule': 'original_linear',
     'sampling': 'fp32_gumbel',
     'electra_mask_style': True,
@@ -41,7 +41,9 @@ c = MyConfig({
 })
 
 # only for my personal research purpose
-hparam_update = {}
+hparam_update = {
+    
+}
 
 """ Vanilla ELECTRA settings
 'adam_bias_correction': False,
@@ -135,7 +137,7 @@ if c.size in ['small', 'base']:
 
   wb_data = HF_MergedDataset(wiki, book)
   wb_dsets = HF_Datasets({'train': wb_data}, cols=['input_ids','sentA_lenth'], hf_toker=hf_tokenizer, n_inp=2)
-  dls = wb_dsets.dataloaders(bs=c.bs, num_workers=3,
+  dls = wb_dsets.dataloaders(bs=c.bs, num_workers=6,
                              shuffle_train=True,
                              srtkey_fc=False, 
                              cache_dir='./datasets/wikibook_dl', cache_name='dl_{split}.json')
@@ -394,13 +396,12 @@ learn.to_native_fp16(init_scale=2.**11)
 learn.add_cb(GradientClipping(1.))
 
 # Seed
-torch.backends.cudnn.benchmark = False # set to True save you 1hr when training small model, but I rather want to get reproducibility
 random.seed(c.seed)
 np.random.seed(c.seed)
 torch.manual_seed(c.seed)
 
 # Run 
-print(f"{c.run_name} , starts at {datetime.now(timezone(timedelta(hours=+8)))}")
+print(f"{c.run_name} , starts at {datetime.now()}")
 #bk()
 if c.schedule == 'one_cycle': learn.fit_one_cycle(9999, lr_max=c.lr)
 elif c.schedule == 'adjusted_one_cycle': learn.fit_one_cycle(9999, lr_max=c.lr, div=1e5, pct_start=10000/c.steps)

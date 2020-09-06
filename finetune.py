@@ -26,7 +26,7 @@ c = MyConfig({
   'device': 'cuda:0', #List[int]: use multi gpu (data parallel)
   # run [start,end) runs, every run finetune every GLUE tasks once with different seeds.
   'start':0,
-  'end': 2,
+  'end': 10,
   
   'pretrained_checkpoint': 'vanilla_11081_100.0%.pth', # None to downalod model from HuggingFace
   # Seeds for fintuning. i th run use i th seeds, None to use system time
@@ -61,7 +61,7 @@ c = MyConfig({
 
 # only for my personal research purpose
 hparam_update = {
-  
+
 }
 
 """ Vanilla ELECTRA settings
@@ -323,7 +323,7 @@ def hf_electra_param_splitter(model, wsc_trick=False):
   if electra_config.hidden_size != electra_config.embedding_size:
     groups[0] += list_parameters(model, f"{base}.{scaler_name}")
   if c.my_model and hparam['pre_norm']:
-    groups[-1] = list_parameters(model, f"{base}.encoder.norm") + groups[-1]
+    groups[-2] += list_parameters(model, f"{base}.encoder.norm")
 
   assert len(list(model.parameters())) == sum([ len(g) for g in groups])
   for i, (p1, p2) in enumerate(zip(model.parameters(), [ p for g in groups for p in g])):
@@ -421,7 +421,6 @@ if c.do_finetune:
       else: run_name = None; print(task)
       learn, fit_fc = get_glue_learner(task, run_name)
       if c.seeds:
-        torch.backends.cudnn.benchmark = False
         random.seed(c.seeds[i])
         np.random.seed(c.seeds[i])
         torch.manual_seed(c.seeds[i])
