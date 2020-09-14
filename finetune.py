@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 import torch
 from torch import nn
-import nlp
+import datasets
 from fastai.text.all import *
 from transformers import ElectraModel, ElectraConfig, ElectraTokenizerFast, ElectraForPreTraining
 from hugdatafast import *
@@ -23,23 +23,25 @@ from _utils.would_like_to_pr import *
 # %%
 c = MyConfig({
 
-  'device': 'cuda:0', #List[int]: use multi gpu (data parallel)
+  'device': 'cuda:1', #List[int]: use multi gpu (data parallel)
   # run [start,end) runs, every run finetune every GLUE tasks once with different seeds.
-  'start':0,
-  'end': 10,
+  'start':24,
+  'end': 27,
   
-  'pretrained_checkpoint': 'vanilla_11081_100.0%.pth', # None to downalod model from HuggingFace
+  'pretrained_checkpoint': None, # None to downalod model from HuggingFace
   # Seeds for fintuning. i th run use i th seeds, None to use system time
-  'seeds': [939, 481, 569, 620, 159, 808, 816, 101, 554, 104], # for 11081
+  #'seeds': [939, 481, 569, 620, 159, 808, 816, 101, 554, 104], # for 11081
   #'seeds': [611, 609, 830, 237, 668, 608, 475, 690, 53, 94], # for 36
   #'seeds': [775, 961, 778, 915, 979, 526, 99, 669, 806, 78], # for 1188
   #'seeds': [895, 602, 573, 457, 736, 871, 571, 84, 514, 740,], # for 76
-  #'seeds': [760, 63, 392, 240, 794, 168, 245, 345, 97, 917], # 1 
+  #'seeds': [760, 63, 392, 240, 794, 168, 245, 345, 97, 917], # 1
+  'seeds': [939, 481, 569, 620, 159, 808, 816, 101, 554, 104, 611, 609, 830, 237, 668, 608, 475, 690, 53, 94, 775, 961, 778, 915, 979, 526, 99, 669, 806, 78, 895, 602, 573, 457, 736, 871, 571, 84, 514, 740,760, 63, 392, 240, 794, 168, 245, 345, 97, 917],
 
   'adam_bias_correction': False,
   'xavier_reinited_outlayer': True,
   'schedule': 'original_linear',
   'original_lr_layer_decays': True,
+  'weight_decay': 0.01,
   
   # whether to do finetune or test
   'do_finetune': True, # True -> do finetune ; False -> do test
@@ -102,7 +104,7 @@ if c.group_name is not False and c.do_finetune:
     def after_batch(self): pass
     def after_epoch(self):
       if self.epoch == (self.n_epoch - 1): super().after_epoch()
-  neptune.init(project_qualified_name='richard-wang/electra-glue') # change here to your neptune project name
+  neptune.init(project_qualified_name='natsume/electra-glue', api_token="eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vdWkubmVwdHVuZS5haSIsImFwaV91cmwiOiJodHRwczovL3VpLm5lcHR1bmUuYWkiLCJhcGlfa2V5IjoiOWIxMDAxMDEtOGQyNy00YzdlLWI4ZTYtYjI4ZDZkYWRlZDcyIn0=") # change here to your neptune project name
 
 # my model
 if c.my_model:
@@ -117,7 +119,9 @@ Path('./datasets').mkdir(exist_ok=True)
 Path('./checkpoints/glue').mkdir(exist_ok=True, parents=True)
 Path('./test_outputs/glue').mkdir(exist_ok=True, parents=True)
 c.pretrained_ckp_path = Path(f'./checkpoints/pretrain/{c.pretrained_checkpoint}')
-if c.group_name is None: c.group_name = c.pretrained_checkpoint[:-4]
+if c.group_name is None:
+  if c.pretrained_checkpoint: c.group_name = c.pretrained_checkpoint[:-4]
+  elif c.pretrained_checkpoint is None: c.group_name = f"{c.size}++"
 
 # Print info
 print(f"process id: {os.getpid()}")
@@ -189,7 +193,7 @@ glue_dsets = {}; glue_dls = {}
 for task in ['cola', 'sst2', 'mrpc', 'qqp', 'stsb', 'mnli', 'qnli', 'rte', 'wnli', 'ax']:
 
   # Load / download datasets.
-  dsets = nlp.load_dataset('glue', task, cache_dir='./datasets')
+  dsets = datasets.load_dataset('glue', task, cache_dir='./datasets')
 
   # There is two samples broken in QQP training set
   if task=='qqp': dsets['train'] = dsets['train'].filter(lambda e: e['question2']!='',
@@ -218,7 +222,7 @@ for task in ['cola', 'sst2', 'mrpc', 'qqp', 'stsb', 'mnli', 'qnli', 'rte', 'wnli
 
 # %%
 if task == 'wnli' and c.wsc_trick:
-  wsc = nlp.load_dataset('super_glue', 'wsc', cache_dir='./datasets')
+  wsc = datasets.load_dataset('super_glue', 'wsc', cache_dir='./datasets')
   wsc['train'] = wsc['train'].filter(lambda e: e['label']==1,
                  cache_file_name='./datasets/super_glue/wsc/1.0.2/filtered_tricked_train.arrow')
   glue_dsets['wnli'] = WSCTrickTfm(dsets, hf_toker=hf_tokenizer).map(cache_name="tricked_{split}.arrow")
@@ -340,7 +344,7 @@ def get_layer_lrs(lr, decay_rate, num_hidden_layers):
 # ## 2.3 learner
 
 # %%
-def get_glue_learner(task, run_name=None, inference=False):
+def get_glue_learner(task, run_name=None, th=None, inference=False):
 
   # Num_epochs
   if task in ['rte', 'stsb']: num_epochs = 10
@@ -372,8 +376,8 @@ def get_glue_learner(task, run_name=None, inference=False):
                             num_hidden_layers=electra_config.num_hidden_layers,)
   
   # Optimizer
-  if c.adam_bias_correction: opt_func = partial(Adam, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=0.01)
-  else: opt_func = partial(Adam_no_bias_correction, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=0.01)
+  if c.adam_bias_correction: opt_func = partial(Adam, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=c.weight_decay)
+  else: opt_func = partial(Adam_no_bias_correction, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=c.weight_decay)
   
   # Learner
   learn = Learner(dls, model,
@@ -394,7 +398,7 @@ def get_glue_learner(task, run_name=None, inference=False):
 
   # Logging
   if run_name and not inference:
-    neptune.create_experiment(name=run_name, params={'task':task, **c, **hparam_update})
+    neptune.create_experiment(name=run_name, params={'task':task, 'th':th, **c, **hparam_update})
     learn.add_cb(SimplerNeptuneCallback(False))
 
   # Learning rate schedule
@@ -419,7 +423,7 @@ if c.do_finetune:
     for task in ['cola', 'sst2', 'mrpc', 'stsb', 'qnli', 'rte', 'qqp', 'mnli', 'wnli']:
       if c.group_name: run_name = f"{c.group_name}_{task}_{i}";
       else: run_name = None; print(task)
-      learn, fit_fc = get_glue_learner(task, run_name)
+      learn, fit_fc = get_glue_learner(task, run_name, i)
       if c.seeds:
         random.seed(c.seeds[i])
         np.random.seed(c.seeds[i])
