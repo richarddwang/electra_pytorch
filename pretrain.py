@@ -11,7 +11,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.tensor as T
-import nlp
+import datasets
 from fastai.text.all import *
 from transformers import ElectraConfig, ElectraTokenizerFast, ElectraForMaskedLM, ElectraForPreTraining
 from hugdatafast import *
@@ -25,19 +25,21 @@ from _utils.would_like_to_pr import *
 c = MyConfig({
     'device': 'cuda:0',
     
-    'base_run_name': 'vanilla', # run_name = {base_run_name}_{seed}
-    'seed': 11081, # 11081 36 1188 76 1 # None/False to randomly choose seed from [0,99999]
+    'base_run_name': 'openf', # run_name = {base_run_name}_{seed}
+    'seed': 1, # 11081 36 1188 76 1 4 # None/False to randomly choose seed from [0,99999]
+    'book': 'multi',
 
     'adam_bias_correction': False,
     'schedule': 'original_linear',
     'sampling': 'fp32_gumbel',
     'electra_mask_style': True,
-    'tie_gen_in_out_embedding': False,
     'gen_smooth_label': False,
     'disc_smooth_label': False,
 
     'size': 'small',
-    'my_model': False, # False to use huggingface model architecture (untrained weights)
+    'datas': ['openwebtext'],
+    'neptune_logging': True,
+    'my_model': True, # only for my personal research purpose
 })
 
 # only for my personal research purpose
@@ -50,7 +52,6 @@ hparam_update = {
 'schedule': 'original_linear',
 'sampling': 'fp32_gumbel',
 'electra_mask_style': True,
-'tie_gen_in_out_embedding': False,
 'gen_smooth_label': False,
 'disc_smooth_label': False,
 """
@@ -60,6 +61,8 @@ hparam_update = {
 # Check and Default
 assert c.sampling in ['fp32_gumbel', 'fp16_gumbel', 'multinomial']
 assert c.schedule in ['original_linear', 'separate_linear', 'one_cycle', 'adjusted_one_cycle']
+for data in c.datas: assert data in ['wikipedia', 'bookcorpus', 'openwebtext']
+assert c.book in ['single', 'bi','multi', 'just']
 if not c.base_run_name: c.base_run_name = str(datetime.now(timezone(timedelta(hours=+8))))[6:-13].replace(' ','').replace(':','').replace('-','')
 if not c.seed: c.seed = random.randint(0, 99999)
 c.run_name = f'{c.base_run_name}_{c.seed}'
@@ -78,18 +81,23 @@ disc_config = ElectraConfig.from_pretrained(f'google/electra-{c.size}-discrimina
 gen_config = ElectraConfig.from_pretrained(f'google/electra-{c.size}-generator')
 # note that public electra-small model is actually small++ and don't scale down generator size 
 gen_config.hidden_size = int(disc_config.hidden_size/generator_size_divisor)
-gen_config.num_attention_heads = int(disc_config.num_attention_heads/generator_size_divisor)
-gen_config.intermediate_size = int(disc_config.intermediate_size/generator_size_divisor)
+gen_config.num_attention_heads = disc_config.num_attention_heads//generator_size_divisor
+gen_config.intermediate_size = disc_config.intermediate_size//generator_size_divisor
 hf_tokenizer = ElectraTokenizerFast.from_pretrained(f"google/electra-{c.size}-generator")
+
+# neptune (logging)
+if c.neptune_logging:
+  import neptune
+  from fastai.callback.neptune import NeptuneCallback
+  class CustomNeptuneCallback(NeptuneCallback):
+    def after_epoch(self): pass
+  neptune.init(project_qualified_name='richard-wang/electra-pretrain')
 
 # Path to data
 Path('./datasets', exist_ok=True)
 Path('./checkpoints/pretrain').mkdir(exist_ok=True, parents=True)
-if c.size in ['small', 'base']:
-  wiki_cache_dir = Path("./datasets/wikipedia/20200501.en/1.0.0")
-  book_cache_dir = Path("./datasets/bookcorpus/plain_text/1.0.0")
-  wbdl_cache_dir = Path("./datasets/wikibook_dl")
-  wbdl_cache_dir.mkdir(exist_ok=True)
+edl_cache_dir = Path("./datasets/electra_dataloader")
+edl_cache_dir.mkdir(exist_ok=True)
 
 # Print info
 print(f"process id: {os.getpid()}")
@@ -111,39 +119,49 @@ if c.my_model:
 # # 1. Load Data
 
 # %%
-if c.size in ['small', 'base']:
-  
-  # wiki
-  if (wiki_cache_dir/f"wiki_electra_{c.max_length}.arrow").exists():
-    print('loading the electra data (wiki)')
-    wiki = nlp.Dataset.from_file(str(wiki_cache_dir/f"wiki_electra_{c.max_length}.arrow"))
+dsets = []
+ELECTRAProcessor = partial(ELECTRADataProcessor, hf_tokenizer=hf_tokenizer, max_length=c.max_length)
+
+# Wikipedia
+if 'wikipedia' in c.datas:
+  print('load/download wiki dataset')
+  wiki = datasets.load_dataset('wikipedia', '20200501.en', cache_dir='./datasets')['train']
+  print('load/create data from wiki dataset for ELECTRA')
+  e_wiki = ELECTRAProcessor(wiki).map(cache_file_name=f"electra_wiki_{c.max_length}.arrow", num_proc=1)
+  dsets.append(e_wiki)
+
+# BookCorpus['single', 'bi','multi']
+if 'bookcorpus' in c.datas:
+  print('load/download BookCorpus dataset')
+  book = datasets.load_dataset('bookcorpus', cache_dir='./datasets')['train']
+  print('load/create data from BookCorpus dataset for ELECTRA')
+  if c.book == 'single':
+    e_book = ConcatTransform(book, hf_tokenizer, c.max_length, book=c.book).map(cache_file_name=f"electra_sbook_{c.max_length}.arrow")
+  elif c.book == 'bi':
+    e_book = ConcatTransform(book, hf_tokenizer, c.max_length, book=c.book).map(cache_file_name=f"electra_bibook_{c.max_length}.arrow")
+  elif c.book == 'just':
+    e_book = ELECTRADataTransform(book, False, 'text', c.max_length, hf_tokenizer).map(cache_file_name=f"electra_jbook_{c.max_length}.arrow")
   else:
-    print('load/download wiki dataset')
-    wiki = nlp.load_dataset('wikipedia', '20200501.en', cache_dir='./datasets')['train']
-  
-    print('creat data from wiki dataset for ELECTRA')
-    wiki = ELECTRADataTransform(wiki, is_docs=True, text_col='text', max_length=c.max_length, hf_toker=hf_tokenizer).map(cache_file_name=str(wiki_cache_dir/f"wiki_electra_{c.max_length}.arrow"))
+    e_book = ConcatTransform(book, hf_tokenizer, c.max_length).map(cache_file_name=f"electra_book_{c.max_length}.arrow")
+  dsets.append(e_book)
 
-  # bookcorpus
-  if (book_cache_dir/f"book_electra_{c.max_length}.arrow").exists():
-    print('loading the electra data (BookCorpus)')
-    book = nlp.Dataset.from_file(str(book_cache_dir/f"book_electra_{c.max_length}.arrow"))
-  else:
-    print('load/download BookCorpus dataset')
-    book = nlp.load_dataset('bookcorpus', cache_dir='./datasets')['train']
-  
-    print('creat data from BookCorpus dataset for ELECTRA')
-    book = ELECTRADataTransform(book, is_docs=False, text_col='text', max_length=c.max_length, hf_toker=hf_tokenizer).map(cache_file_name=str(book_cache_dir/f"book_electra_{c.max_length}.arrow"))
+# OpenWebText
+if 'openwebtext' in c.datas:
+  print('load/download OpenWebText Corpus')
+  owt = datasets.load_dataset('/home/yisiang/datasets/datasets/openwebtext/openwebtext.py', cache_dir='./datasets')['train']
+  print('load/create data from OpenWebText Corpus for ELECTRA')
+  e_owt = ELECTRAProcessor(owt, apply_cleaning=False).map(cache_file_name=f"electra_owt_{c.max_length}.arrow", num_proc=1)
+  dsets.append(e_owt)
 
-  wb_data = HF_MergedDataset(wiki, book)
-  wb_dsets = HF_Datasets({'train': wb_data}, cols=['input_ids','sentA_lenth'], hf_toker=hf_tokenizer, n_inp=2)
-  dls = wb_dsets.dataloaders(bs=c.bs, num_workers=6,
-                             shuffle_train=True,
-                             srtkey_fc=False, 
-                             cache_dir='./datasets/wikibook_dl', cache_name='dl_{split}.json')
+assert len(dsets) == len(c.datas)
 
-else: # for large size
-  raise NotImplementedError
+merged_dsets = {'train': datasets.concatenate_datasets(dsets)}
+hf_dsets = HF_Datasets(merged_dsets, cols={'input_ids':TensorText,'sentA_length':noop},
+                       hf_toker=hf_tokenizer, n_inp=2)
+dls = hf_dsets.dataloaders(bs=c.bs, num_workers=6,
+                           shuffle_train=True,
+                           srtkey_fc=False, 
+                           cache_dir='./datasets/electra_dataloader', cache_name='dl_{split}.json')
 
 # %% [markdown]
 # # 2. Masked language model objective
@@ -346,25 +364,19 @@ class ELECTRALoss():
 # %%
 # Generator and Discriminator
 if c.my_model:
-  gen_hparam['tie_in_out_embedding'] = c.tie_gen_in_out_embedding
   generator = ModelForGenerator(gen_hparam)
   discriminator = ModelForDiscriminator(disc_hparam)
   discriminator.electra.embedding = generator.electra.embedding
+  # implicitly tie in/out embeddings of generator
 else:
   generator = ElectraForMaskedLM(gen_config)
   discriminator = ElectraForPreTraining(disc_config)
   discriminator.electra.embeddings = generator.electra.embeddings
-  if c.tie_gen_in_out_embedding:
-    generator.generator_predictions.dense.weight = generator.electra.embeddings.word_embeddings.weight
+  generator.generator_lm_head.weight = generator.electra.embeddings.word_embeddings.weight
 
 # ELECTRA training loop
 electra_model = ELECTRAModel(generator, discriminator, hf_tokenizer)
 electra_loss_func = ELECTRALoss(gen_label_smooth=c.gen_smooth_label, disc_label_smooth=c.disc_smooth_label)
-
-# jit (Haven't fiqured out how to make it work)
-# input_ids, sentA_lenths = dls.one_batch()
-# masked_inputs, labels, is_mlm_applied = mlm_cb.mask_tokens(input_ids)
-# electra_jit_model = torch.jit.trace(electra_model, (masked_inputs, sentA_lenths, is_mlm_applied, labels))
 
 # Optimizer
 if c.adam_bias_correction: opt_func = partial(Adam, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=0.01)
@@ -391,18 +403,25 @@ learn = Learner(dls, electra_model,
                      ],
                 )
 
+# neptune logging (optional)
+if c.neptune_logging:
+  neptune.create_experiment(name=c.run_name, params={**c, **hparam_update})
+  learn.add_cb(CustomNeptuneCallback(False))
+
 # Mixed precison and Gradient clip
 learn.to_native_fp16(init_scale=2.**11)
 learn.add_cb(GradientClipping(1.))
 
+# Print time and run name
+print(f"{c.run_name} , starts at {datetime.now()}")
+
 # Seed
+torch.backends.cudnn.benchmark = False
 random.seed(c.seed)
 np.random.seed(c.seed)
 torch.manual_seed(c.seed)
 
-# Run 
-print(f"{c.run_name} , starts at {datetime.now()}")
-#bk()
+# Run
 if c.schedule == 'one_cycle': learn.fit_one_cycle(9999, lr_max=c.lr)
 elif c.schedule == 'adjusted_one_cycle': learn.fit_one_cycle(9999, lr_max=c.lr, div=1e5, pct_start=10000/c.steps)
 else: learn.fit(9999, cbs=[lr_shedule])

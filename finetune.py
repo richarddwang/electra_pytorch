@@ -4,6 +4,7 @@
 import os,sys
 from pathlib import Path
 from functools import partial
+from inspect import isclass
 import random
 from IPython.core.debugger import set_trace as bk
 import pandas as pd
@@ -23,32 +24,33 @@ from _utils.would_like_to_pr import *
 # %%
 c = MyConfig({
 
-  'device': 'cuda:1', #List[int]: use multi gpu (data parallel)
+  'device': 'cuda:0', #List[int]: use multi gpu (data parallel)
   # run [start,end) runs, every run finetune every GLUE tasks once with different seeds.
-  'start':24,
-  'end': 27,
+  'start':3,
+  'end': 4,
   
   'pretrained_checkpoint': None, # None to downalod model from HuggingFace
   # Seeds for fintuning. i th run use i th seeds, None to use system time
   #'seeds': [939, 481, 569, 620, 159, 808, 816, 101, 554, 104], # for 11081
-  #'seeds': [611, 609, 830, 237, 668, 608, 475, 690, 53, 94], # for 36
+  'seeds': [611, 609, 830, 237, 668, 608, 475, 690, 53, 94], # for 36
   #'seeds': [775, 961, 778, 915, 979, 526, 99, 669, 806, 78], # for 1188
   #'seeds': [895, 602, 573, 457, 736, 871, 571, 84, 514, 740,], # for 76
-  #'seeds': [760, 63, 392, 240, 794, 168, 245, 345, 97, 917], # 1
-  'seeds': [939, 481, 569, 620, 159, 808, 816, 101, 554, 104, 611, 609, 830, 237, 668, 608, 475, 690, 53, 94, 775, 961, 778, 915, 979, 526, 99, 669, 806, 78, 895, 602, 573, 457, 736, 871, 571, 84, 514, 740,760, 63, 392, 240, 794, 168, 245, 345, 97, 917],
+  #'seeds': [760, 63, 392, 240, 794, 168, 245, 345, 97, 917], # 1 
 
   'adam_bias_correction': False,
   'xavier_reinited_outlayer': True,
   'schedule': 'original_linear',
   'original_lr_layer_decays': True,
-  'weight_decay': 0.01,
+  'weight_decay': 0,
   
   # whether to do finetune or test
   'do_finetune': True, # True -> do finetune ; False -> do test
   # finetuning checkpoint for testing. These will become "ckp_dir/{task}_{group_name}_{th_run}.pth"
-  'th_run': {'cola': 7, 'sst2': 2, 'mrpc': 7, 'qqp': 4, 'stsb': 9, 'qnli': 9, 'rte': 4, 'mnli': 0, 'ax': 0,
-             'wnli': 2, 
-             },
+  'th_run': { 'qqp': 15, 'qnli': 11,
+              'mrpc': 17, 'mnli': 12, 'ax': 12,
+              'sst2': 13, 'rte': 19,  'wnli': 17, 
+              'cola': 13, 'stsb': 16,  
+            },
   
   'size': 'small',
   'wsc_trick': False,
@@ -59,11 +61,12 @@ c = MyConfig({
   'group_name': None,
   # None: use name of checkpoint.
   # False: don't do online logging and don't save checkpoints
+  'mixed_precision': True,
 })
 
 # only for my personal research purpose
 hparam_update = {
-
+  
 }
 
 """ Vanilla ELECTRA settings
@@ -104,7 +107,7 @@ if c.group_name is not False and c.do_finetune:
     def after_batch(self): pass
     def after_epoch(self):
       if self.epoch == (self.n_epoch - 1): super().after_epoch()
-  neptune.init(project_qualified_name='natsume/electra-glue', api_token="eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vdWkubmVwdHVuZS5haSIsImFwaV91cmwiOiJodHRwczovL3VpLm5lcHR1bmUuYWkiLCJhcGlfa2V5IjoiOWIxMDAxMDEtOGQyNy00YzdlLWI4ZTYtYjI4ZDZkYWRlZDcyIn0=") # change here to your neptune project name
+  neptune.init(project_qualified_name='natsume/electra-glue', api_token='eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vdWkubmVwdHVuZS5haSIsImFwaV91cmwiOiJodHRwczovL3VpLm5lcHR1bmUuYWkiLCJhcGlfa2V5IjoiOWIxMDAxMDEtOGQyNy00YzdlLWI4ZTYtYjI4ZDZkYWRlZDcyIn0=') # change here to your neptune project name
 
 # my model
 if c.my_model:
@@ -130,10 +133,10 @@ print(c)
 
 # %%
 METRICS = {
-  **{ task:['MatthewsCorrCoef'] for task in ['cola']},
-  **{ task:['Accuracy'] for task in ['sst2', 'mnli', 'qnli', 'rte', 'wnli', 'snli','ax']},
-  **{ task:['F1Score', 'Accuracy'] for task in ['mrpc', 'qqp']}, 
-  **{ task:['PearsonCorrCoef', 'SpearmanCorrCoef'] for task in ['stsb']}
+  **{ task:[MatthewsCorrCoef()] for task in ['cola']},
+  **{ task:[accuracy] for task in ['sst2', 'mnli', 'qnli', 'rte', 'wnli', 'snli','ax']},
+  **{ task:[F1Score(), accuracy] for task in ['mrpc', 'qqp']}, 
+  **{ task:[PearsonCorrCoef(), SpearmanCorrCoef()] for task in ['stsb']}
 }
 NUM_CLASS = {
     **{ task:1 for task in ['stsb']},
@@ -152,9 +155,8 @@ LOSS_FUNC = {
     **{ task: MyMSELossFlat(low=0.0, high=5.0) for task in ['stsb']}
 }
 if c.wsc_trick: 
-  LOSS_FUNC['wnli'] = ELECTRAWSCTrickLoss
-  raise NotImplementedError
-  METRICS['wnli'] = accuracy_electra_wsc_trick
+  LOSS_FUNC['wnli'] = ELECTRAWSCTrickLoss()
+  METRICS['wnli'] = [wsc_trick_accuracy]
 
 # %% [markdown]
 # # 2. Data
@@ -190,7 +192,7 @@ def tokenize_sents_max_len(example, cols, max_len, swap=False):
 
 # %%
 glue_dsets = {}; glue_dls = {}
-for task in ['cola', 'sst2', 'mrpc', 'qqp', 'stsb', 'mnli', 'qnli', 'rte', 'wnli', 'ax']:
+for task in ['cola', 'sst2', 'mrpc', 'stsb', 'mnli', 'qqp', 'qnli', 'rte', 'wnli', 'ax']:
 
   # Load / download datasets.
   dsets = datasets.load_dataset('glue', task, cache_dir='./datasets')
@@ -207,7 +209,7 @@ for task in ['cola', 'sst2', 'mrpc', 'qqp', 'stsb', 'mnli', 'qnli', 'rte', 'wnli
     swap_tok_func = partial(tokenize_sents_max_len, cols=TEXT_COLS[task], max_len=c.max_length, swap=True)
     swapped_train = dsets['train'].my_map(swap_tok_func, 
                                           cache_file_name=f"swapped_tokenized_{c.max_length}_train")
-    glue_dsets[task]['train'] = HF_MergedDataset(glue_dsets[task]['train'], swapped_train)
+    glue_dsets[task]['train'] = datasets.concatenate_datasets([glue_dsets[task]['train'], swapped_train])
 
   # Load / Make dataloaders
   hf_dsets = HF_Datasets(glue_dsets[task], hf_toker=hf_tokenizer, n_inp=3,
@@ -221,14 +223,13 @@ for task in ['cola', 'sst2', 'mrpc', 'qqp', 'stsb', 'mnli', 'qnli', 'rte', 'wnli
 
 
 # %%
-if task == 'wnli' and c.wsc_trick:
+if c.wsc_trick:
   wsc = datasets.load_dataset('super_glue', 'wsc', cache_dir='./datasets')
-  wsc['train'] = wsc['train'].filter(lambda e: e['label']==1,
-                 cache_file_name='./datasets/super_glue/wsc/1.0.2/filtered_tricked_train.arrow')
-  glue_dsets['wnli'] = WSCTrickTfm(dsets, hf_toker=hf_tokenizer).map(cache_name="tricked_{split}.arrow")
-  hf_dsets = HF_Datasets(glue_dsets[task], hf_toker=hf_tokenizer, n_inp=4,
-cols={'prefix':TensorText, 'suffix':TensorText, 'cands':TensorText, 'cand_lens':noop, 'label':TensorCategory})
-  glue_dls['wnli'] = hf_dsets.dataloaders(bs=32, cache_name="dl_tricked_{split}.json")
+  glue_dsets['wnli'] = wsc.my_map(partial(wsc_trick_process, hf_toker=hf_tokenizer),
+                                  cache_file_names="tricked_{split}.arrow")
+  cols={'prefix':TensorText,'suffix':TensorText,'cands':TensorText,'cand_lens':noop,'label':TensorCategory}
+  glue_dls['wnli'] = HF_Datasets(glue_dsets['wnli'], hf_toker=hf_tokenizer, n_inp=4, 
+                                 cols=cols).dataloaders(bs=32, cache_name="dl_tricked_{split}.json")
 
 # %% [markdown]
 # ## 1.2 View Data
@@ -344,7 +345,8 @@ def get_layer_lrs(lr, decay_rate, num_hidden_layers):
 # ## 2.3 learner
 
 # %%
-def get_glue_learner(task, run_name=None, th=None, inference=False):
+def get_glue_learner(task, run_name=None, inference=False):
+  is_wsc_trick = task=='wnli' and c.wsc_trick
 
   # Num_epochs
   if task in ['rte', 'stsb']: num_epochs = 10
@@ -364,13 +366,13 @@ def get_glue_learner(task, run_name=None, th=None, inference=False):
     load_part_model(c.pretrained_ckp_path, discriminator, 'discriminator')
 
   # Create finetuning model
-  if task=='wnli' and c.wsc_trick: 
+  if is_wsc_trick: 
     model = ELECTRAWSCTrickModel(discriminator, hf_tokenizer.pad_token_id)
   else:
     model = SentencePredictor(discriminator.electra, electra_config.hidden_size, num_class=NUM_CLASS[task])
 
   # Discriminative learning rates
-  splitter = partial( hf_electra_param_splitter, wsc_trick=(task=='wnli' and c.wsc_trick) )
+  splitter = partial( hf_electra_param_splitter, wsc_trick=is_wsc_trick )
   layer_lrs = get_layer_lrs(lr=c.lr, 
                             decay_rate=c.layer_lr_decay,
                             num_hidden_layers=electra_config.num_hidden_layers,)
@@ -383,22 +385,26 @@ def get_glue_learner(task, run_name=None, th=None, inference=False):
   learn = Learner(dls, model,
                   loss_func=LOSS_FUNC[task], 
                   opt_func=opt_func,
-                  metrics=[eval(f'{metric}()') for metric in METRICS[task]],
+                  metrics=METRICS[task],
                   splitter=splitter if not inference else trainable_params,
                   lr=layer_lrs if not inference else defaults.lr,
-                  path='./checkpoints',
-                  model_dir='glue',)
-  
+                  path='./checkpoints/glue',
+                  model_dir=c.group_name,)
+
   # Multi gpu
   if isinstance(c.device, list) or c.device is None:
     learn.model = nn.DataParallel(learn.model, device_ids=c.device)
+
+  # Mixed precision
+  if c.mixed_precision:
+    learn.to_native_fp16(init_scale=2.**14)
 
   # Gradient clip
   learn.add_cb(GradientClipping(1.0))
 
   # Logging
   if run_name and not inference:
-    neptune.create_experiment(name=run_name, params={'task':task, 'th':th, **c, **hparam_update})
+    neptune.create_experiment(name=run_name, params={'task':task, **c, **hparam_update})
     learn.add_cb(SimplerNeptuneCallback(False))
 
   # Learning rate schedule
@@ -420,25 +426,26 @@ def get_glue_learner(task, run_name=None, th=None, inference=False):
 # %%
 if c.do_finetune:
   for i in range(c.start, c.end):
-    for task in ['cola', 'sst2', 'mrpc', 'stsb', 'qnli', 'rte', 'qqp', 'mnli', 'wnli']:
+    for task in ['qqp', 'mnli', 'wnli']:#['cola', 'sst2', 'mrpc', 'stsb', 'rte', 'qnli', 'qqp', 'mnli', 'wnli']:
       if c.group_name: run_name = f"{c.group_name}_{task}_{i}";
       else: run_name = None; print(task)
-      learn, fit_fc = get_glue_learner(task, run_name, i)
+      learn, fit_fc = get_glue_learner(task, run_name)
       if c.seeds:
+        torch.backends.cudnn.benchmark = False
         random.seed(c.seeds[i])
         np.random.seed(c.seeds[i])
         torch.manual_seed(c.seeds[i])
       fit_fc()
-      if run_name: learn.save(run_name)
+      if run_name: learn.save(f"{task}_{i}")
 
 # %% [markdown]
 # # 3. Testing
 
 # %%
-# Haven't find way to validate and log tow datasets in the training loop, so validate mnli-mm here as a workaround
+# Haven't found way to validate and log two datasets in the training loop, so validate mnli-mm here as a workaround
 if not c.do_finetune:
   learn, _ = get_glue_learner('mnli', inference=True)
-  learn.load(f"{c.group_name}_mnli_{c.th_run['mnli']}")
+  learn.load(f"mnli_{c.th_run['mnli']}")
   with learn.no_mbar():
     print(learn.validate(ds_idx=2))
 
@@ -488,9 +495,9 @@ if not c.do_finetune:
     print(task)
     # ax use mnli ckp
     if isinstance(th, int):
-      ckp = f"{c.group_name}_{task}_{th}" if task != 'ax' else f"{c.group_name}_mnli_{th}"
+      ckp = f"{task}_{th}" if task != 'ax' else f"mnli_{th}"
     else:
-      ckp = [f"{c.group_name}_{task}_{i}" if task != 'ax' else f"{c.group_name}_mnli_{i}" for i in th]
+      ckp = [f"{task}_{i}" if task != 'ax' else f"mnli_{i}" for i in th]
     # run test for all testset in this task
     dl_idxs = [-1, -2] if task=='mnli' else [-1]
     for dl_idx in dl_idxs:
