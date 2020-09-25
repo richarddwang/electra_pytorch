@@ -11,6 +11,15 @@ I pretrain ELECTRA-small from scratch and has successfully replicate the paper's
 |ELECTRA-Small|54.6|89.1|83.7|80.3|88.0|79.7|87.7|60.8|78.0|
 |ELECTRA-Small (my)|57.2|87.1|82.1|80.4|88|78.9|87.9|63.1|78.08
 
+**!! I can't reproduce my results above now and I currently working on it. !!**
+
+|Model|CoLA|SST|MRPC|STS|QQP|MNLI|QNLI|RTE|Avg.|
+|---|---|---|---|---|---|---|---|---|---|
+|ELECTRA-Small++|55.6|91.1|84.9|84.6|88.0|81.6|88.3|6.36|79.7|
+|ELECTRA-Small++ (finetune public checpoint using electra_pytorch)|54.8|91.6|84.6|84.2|88.5|82|89|64.7|79.92
+
+finetuning script should be ok
+
 Results for models on the GLUE test set.
 
 # Features of this implementation

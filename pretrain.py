@@ -25,9 +25,8 @@ from _utils.would_like_to_pr import *
 c = MyConfig({
     'device': 'cuda:0',
     
-    'base_run_name': 'openf', # run_name = {base_run_name}_{seed}
-    'seed': 1, # 11081 36 1188 76 1 4 # None/False to randomly choose seed from [0,99999]
-    'book': 'multi',
+    'base_run_name': 'vanilla', # run_name = {base_run_name}_{seed}
+    'seed': 7, # 11081 36 1188 76 1 4 4649 7 9 99 # None/False to randomly choose seed from [0,99999]
 
     'adam_bias_correction': False,
     'schedule': 'original_linear',
@@ -38,7 +37,9 @@ c = MyConfig({
 
     'size': 'small',
     'datas': ['openwebtext'],
-    'neptune_logging': True,
+    
+    'neptune_logging': False,
+    'num_workers': 3,
     'my_model': True, # only for my personal research purpose
 })
 
@@ -54,6 +55,8 @@ hparam_update = {
 'electra_mask_style': True,
 'gen_smooth_label': False,
 'disc_smooth_label': False,
+'size': 'small',
+'datas': ['openwebtext'],
 """
 
 
@@ -62,9 +65,8 @@ hparam_update = {
 assert c.sampling in ['fp32_gumbel', 'fp16_gumbel', 'multinomial']
 assert c.schedule in ['original_linear', 'separate_linear', 'one_cycle', 'adjusted_one_cycle']
 for data in c.datas: assert data in ['wikipedia', 'bookcorpus', 'openwebtext']
-assert c.book in ['single', 'bi','multi', 'just']
 if not c.base_run_name: c.base_run_name = str(datetime.now(timezone(timedelta(hours=+8))))[6:-13].replace(' ','').replace(':','').replace('-','')
-if not c.seed: c.seed = random.randint(0, 99999)
+if not c.seed: c.seed = random.randint(0, 999999)
 c.run_name = f'{c.base_run_name}_{c.seed}'
 if c.gen_smooth_label is True: c.gen_smooth_label = 0.1
 if c.disc_smooth_label is True: c.disc_smooth_label = 0.1
@@ -106,7 +108,7 @@ print(hparam_update)
 
 
 # %%
-if c.my_model:
+if c.my_model: # only for use of my personal research 
   sys.path.insert(0, os.path.abspath(".."))
   from modeling.model import ModelForGenerator,ModelForDiscriminator
   from hyperparameter import electra_hparam_from_hf
@@ -130,21 +132,6 @@ if 'wikipedia' in c.datas:
   e_wiki = ELECTRAProcessor(wiki).map(cache_file_name=f"electra_wiki_{c.max_length}.arrow", num_proc=1)
   dsets.append(e_wiki)
 
-# BookCorpus['single', 'bi','multi']
-if 'bookcorpus' in c.datas:
-  print('load/download BookCorpus dataset')
-  book = datasets.load_dataset('bookcorpus', cache_dir='./datasets')['train']
-  print('load/create data from BookCorpus dataset for ELECTRA')
-  if c.book == 'single':
-    e_book = ConcatTransform(book, hf_tokenizer, c.max_length, book=c.book).map(cache_file_name=f"electra_sbook_{c.max_length}.arrow")
-  elif c.book == 'bi':
-    e_book = ConcatTransform(book, hf_tokenizer, c.max_length, book=c.book).map(cache_file_name=f"electra_bibook_{c.max_length}.arrow")
-  elif c.book == 'just':
-    e_book = ELECTRADataTransform(book, False, 'text', c.max_length, hf_tokenizer).map(cache_file_name=f"electra_jbook_{c.max_length}.arrow")
-  else:
-    e_book = ConcatTransform(book, hf_tokenizer, c.max_length).map(cache_file_name=f"electra_book_{c.max_length}.arrow")
-  dsets.append(e_book)
-
 # OpenWebText
 if 'openwebtext' in c.datas:
   print('load/download OpenWebText Corpus')
@@ -158,7 +145,7 @@ assert len(dsets) == len(c.datas)
 merged_dsets = {'train': datasets.concatenate_datasets(dsets)}
 hf_dsets = HF_Datasets(merged_dsets, cols={'input_ids':TensorText,'sentA_length':noop},
                        hf_toker=hf_tokenizer, n_inp=2)
-dls = hf_dsets.dataloaders(bs=c.bs, num_workers=6,
+dls = hf_dsets.dataloaders(bs=c.bs, num_workers=c.num_workers, pin_memory=False,
                            shuffle_train=True,
                            srtkey_fc=False, 
                            cache_dir='./datasets/electra_dataloader', cache_name='dl_{split}.json')
@@ -198,13 +185,13 @@ def mask_tokens(inputs, mask_token_index, vocab_size, special_token_indices, mlm
 
   # mask  (mlm_probability * (1-replace_prob-orginal_prob))
   mask_prob = 1 - replace_prob - orginal_prob
-  mask_token_mask = torch.bernoulli(torch.full(labels.shape, 0.8, device=device)).bool() & mlm_mask
+  mask_token_mask = torch.bernoulli(torch.full(labels.shape, mask_prob, device=device)).bool() & mlm_mask
   inputs[mask_token_mask] = mask_token_index
 
   # replace with a random token (mlm_probability * replace_prob)
   if int(replace_prob)!=0:
     rep_prob = replace_prob/(replace_prob + orginal_prob)
-    replace_token_mask = torch.bernoulli(torch.full(labels.shape, 0.5, device=device)).bool() & mlm_mask & ~mask_token_mask
+    replace_token_mask = torch.bernoulli(torch.full(labels.shape, rep_prob, device=device)).bool() & mlm_mask & ~mask_token_mask
     random_words = torch.randint(vocab_size, labels.shape, dtype=torch.long, device=device)
     inputs[replace_token_mask] = random_words[replace_token_mask]
 
@@ -352,16 +339,17 @@ class ELECTRALoss():
     disc_loss = self.disc_loss_fc(disc_logits.float(), is_replaced.float())
     return gen_loss * self.loss_weights[0] + disc_loss * self.loss_weights[1]
 
-  def decodes(self, pred):
-    gen_logits, generated, disc_logits, is_replaced, non_pad = pred
-    gen_pred = gen_logits.argmax(dim=-1)
-    disc_pred = disc_logits > 0
-    return gen_pred, generated, disc_pred, is_replaced
-
 # %% [markdown]
 # # 5. Train
 
 # %%
+# Seed & PyTorch benchmark
+torch.backends.cudnn.benchmark = True
+dls[0].rng = random.Random(c.seed) # for fastai dataloader
+random.seed(c.seed)
+np.random.seed(c.seed)
+torch.manual_seed(c.seed)
+
 # Generator and Discriminator
 if c.my_model:
   generator = ModelForGenerator(gen_hparam)
@@ -399,7 +387,7 @@ learn = Learner(dls, electra_model,
                 path='./checkpoints',
                 model_dir='pretrain',
                 cbs=[mlm_cb,
-                     RunSteps(c.steps, [0.0625, 0.125, 0.25, 0.5, 1.0], c.run_name+"_{percent}"),
+                    RunSteps(c.steps, [0.0625, 0.125, 0.25, 0.5, 1.0], c.run_name+"_{percent}"),
                      ],
                 )
 
@@ -414,12 +402,6 @@ learn.add_cb(GradientClipping(1.))
 
 # Print time and run name
 print(f"{c.run_name} , starts at {datetime.now()}")
-
-# Seed
-torch.backends.cudnn.benchmark = False
-random.seed(c.seed)
-np.random.seed(c.seed)
-torch.manual_seed(c.seed)
 
 # Run
 if c.schedule == 'one_cycle': learn.fit_one_cycle(9999, lr_max=c.lr)
