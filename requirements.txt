@@ -1,0 +1,7 @@
+torch>=1.6.0
+datasets>=1.1.0
+transformers>=3.3.1
+fastcore>=1.0.20
+fastai>=2.0.15
+wandb>=0.10.4
+hugdatafast>=1.0.0

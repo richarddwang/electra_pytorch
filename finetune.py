@@ -24,45 +24,45 @@ from _utils.would_like_to_pr import *
 # %%
 c = MyConfig({
 
-  'device': 'cuda:2', #List[int]: use multi gpu (data parallel)
+  'device': 'cuda:0', #List[int]: use multi gpu (data parallel)
   # run [start,end) runs, every run finetune every GLUE tasks once with different seeds.
-  'start':9,
+  'start':0,
   'end': 10,
   
-  'pretrained_checkpoint': 'vanilla_11081_100.0%.pth', # None to downalod model from HuggingFace
+  'pretrained_checkpoint': 'vanilla_11081_100.0%.pth', # None to use pretrained ++ model from HuggingFace
   # Seeds for fintuning. i th run use i th seeds, None to use system time
-  'seeds': [939, 481, 569, 620, 159, 808, 816, 101, 554, 104], # for 11081
+  #'seeds': [939, 481, 569, 620, 159, 808, 816, 101, 554, 104], # for 11081
   #'seeds': [611, 609, 830, 237, 668, 608, 475, 690, 53, 94], # for 36
   #'seeds': [775, 961, 778, 915, 979, 526, 99, 669, 806, 78], # for 1188
   #'seeds': [895, 602, 573, 457, 736, 871, 571, 84, 514, 740,], # for 76
-  #'seeds': [760, 63, 392, 240, 794, 168, 245, 345, 97, 917], # for 1 
+  #'seeds': [760, 63, 392, 240, 794, 168, 245, 345, 97, 917], # 1
   #'seeds': [6669, 4093, 6254, 8546, 489, 901, 5567, 3690, 7057, 3663,], # for 4
   #'seeds': [3426, 2730, 6509, 6957, 2961, 7783, 7061, 4261, 2256, 4863,], # for 4649
   #'seeds': [3049, 3005, 3298, 8108, 6676, 2275, 376, 5053, 154, 8992,], # for 7
-  #'seeds': None,
+  'seeds': None,
 
   'weight_decay': 0,
   'adam_bias_correction': False,
   'xavier_reinited_outlayer': True,
   'schedule': 'original_linear',
   'original_lr_layer_decays': True,
+  'double_unordered': True,
   
   # whether to do finetune or test
   'do_finetune': True, # True -> do finetune ; False -> do test
   # finetuning checkpoint for testing. These will become "ckp_dir/{task}_{group_name}_{th_run}.pth"
   'th_run': { 'qqp': 7, 'qnli': 5,
               'mrpc': 7, 'mnli': 2, 'ax': 2,
-              'sst2': 3, 'rte': 7,  'wnli': 2, 
+              'sst2': 3, 'rte': 7,  'wnli': 0, 
               'cola': 1, 'stsb': 8,  
             },
   
   'size': 'small',
   'wsc_trick': False,
-  'double_unordered': True,
 
   'num_workers': 3,
-  'my_model': True, # False to indicate using hf model
-  'logger': 'neptune',
+  'my_model': False, # True only for my personal research
+  'logger': 'wandb',
   'group_name': None, # the name of represents these runs
   # None: use name of checkpoint.
   # False: don't do online logging and don't save checkpoints
@@ -70,12 +70,7 @@ c = MyConfig({
 
 # only for my personal research purpose
 hparam_update = {
-  #'product_type': 'square-l2',
-  #'i_mul': 'KV',
-  #'k_downscale': False,
-  #'i_prob_norm': False,
-  #'intermediate_dropout_rate':0.1,
-  #'pre_norm': True,
+  
 }
 
 """ Vanilla ELECTRA settings
@@ -92,8 +87,6 @@ hparam_update = {
 if not c.do_finetune: assert c.th_run['mnli'] == c.th_run['ax']
 if c.pretrained_checkpoint is None: assert not c.my_model
 assert c.schedule in ['original_linear', 'separate_linear', 'one_cycle', 'adjusted_one_cycle']
-assert c.logger in ['wandb', 'neptune', False, None]
-if c.logger: assert c.group_name is not False
 
 # Settings of different sizes
 if c.size == 'small': c.lr = 3e-4; c.layer_lr_decay = 0.8; c.max_length = 128
@@ -111,6 +104,7 @@ if c.wsc_trick:
   from _utils.wsc_trick import * # importing spacy model takes time
 
 # logging
+# light logging callback here is to only log the last score and avoid exceeding the api access limit
 if c.logger == 'neptune':
   import neptune
   from fastai.callback.neptune import NeptuneCallback
@@ -118,11 +112,11 @@ if c.logger == 'neptune':
     def after_batch(self): pass
     def after_epoch(self):
       if self.epoch == (self.n_epoch - 1): super().after_epoch()
-  neptune.init(project_qualified_name='natsume/electra-glue', api_token="eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vdWkubmVwdHVuZS5haSIsImFwaV91cmwiOiJodHRwczovL3VpLm5lcHR1bmUuYWkiLCJhcGlfa2V5IjoiOWIxMDAxMDEtOGQyNy00YzdlLWI4ZTYtYjI4ZDZkYWRlZDcyIn0=") # change here to your neptune project name
+  neptune.init(project_qualified_name='richard-wang/electra-glue')
 elif c.logger == 'wandb':
   import wandb
   from fastai.callback.wandb import WandbCallback
-  class LightWandbCallback():
+  class LightWandbCallback(Callback):
     def __init__(self, run):
       self.run = run
     def after_epoch(self):
@@ -130,7 +124,7 @@ elif c.logger == 'wandb':
       wandb.log({n:s for n,s in zip(self.recorder.metric_names, self.recorder.log) if n not in ['train_loss', 'epoch', 'time']})
     def after_fit(self):
       wandb.log({}) # ensure sync of last step
-      wandb.finish()
+      self.run.finish()
 
 # my model
 if c.my_model:
@@ -305,8 +299,6 @@ if False:
   glue_dls['ax'].show_batch(max_n=1)
 
 # %% [markdown]
-# 
-# %% [markdown]
 # # 2. Finetuning
 # %% [markdown]
 # ## 2.1 Finetuning model
@@ -403,7 +395,7 @@ def get_glue_learner(task, run_name=None, inference=False):
     model = SentencePredictor(discriminator.electra, electra_config.hidden_size, num_class=NUM_CLASS[task])
 
   # Discriminative learning rates
-  splitter = partial( hf_electra_param_splitter, wsc_trick=is_wsc_trick )
+  splitter = partial( hf_electra_param_splitter, wsc_trick=is_wsc_trick)
   layer_lrs = get_layer_lrs(lr=c.lr, 
                             decay_rate=c.layer_lr_decay,
                             num_hidden_layers=electra_config.num_hidden_layers,)
@@ -424,6 +416,7 @@ def get_glue_learner(task, run_name=None, inference=False):
 
   # Multi gpu
   if isinstance(c.device, list) or c.device is None:
+    learn.create_opt()
     learn.model = nn.DataParallel(learn.model, device_ids=c.device)
 
   # Mixed precision
@@ -432,6 +425,7 @@ def get_glue_learner(task, run_name=None, inference=False):
   # Gradient clip
   learn.add_cb(GradientClipping(1.0))
   
+  # Logging
   # Logging
   if run_name and not inference:
     if c.logger == 'neptune':
