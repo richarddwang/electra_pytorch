@@ -45,7 +45,7 @@ Official training loss curve |  My training loss curve
 |---|---|---|---|---|
 |81.38|0.57|82.23|80.42|14|
 
-*Tabel 4:* Statistics of dev results of small models. Every model is pretrained from scratch with different seeds and finetuned for 10 random runs for each GLUE task. Score of a model is the average of the best of 10 for each task. (The process is as same as the one described in the paper) As we can see, although ELECTRA is mocking adeversarial training, it has a good training stability.
+*Tabel 4:* Statistics of GLUE devset results for small models. Every model is pretrained from scratch with different seeds and finetuned for 10 random runs for each GLUE task. Score of a model is the average of the best of 10 for each task. (The process is as same as the one described in the paper) As we can see, although ELECTRA is mocking adeversarial training, it has a good training stability.
 
 ## How stable is ELECTRA finetuing on GLUE ?
 |Model|CoLA|SST|MRPC|STS|QQP|MNLI|QNLI|RTE|
