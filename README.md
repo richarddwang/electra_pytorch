@@ -10,19 +10,22 @@ I pretrain ELECTRA-small from scratch and have successfully replicated the paper
 |---|---|---|---|---|---|---|---|---|---|
 |ELECTRA-Small-OWT|56.8|88.3|87.4|86.8|88.3|78.9|87.9|68.5|80.36|
 |ELECTRA-Small-OWT (my)|58.72|88.03|86.04|86.16|88.63|80.4|87.45|67.46|80.36
-Table1. Results on GLUE dev set. The official result comes from [expected results](https://github.com/google-research/electra#expected-results). Scores are the average scores finetuned from the same checkpoint. (See [this issue](https://github.com/google-research/electra/issues/98)) My result comes from pretraining a model from scratch and thens taking average from 10 finetuning runs for each task. Both results are trained on OpenWebText corpus
+
+*Table 1:* Results on GLUE dev set. The official result comes from [expected results](https://github.com/google-research/electra#expected-results). Scores are the average scores finetuned from the same checkpoint. (See [this issue](https://github.com/google-research/electra/issues/98)) My result comes from pretraining a model from scratch and thens taking average from 10 finetuning runs for each task. Both results are trained on OpenWebText corpus
 
 
 |Model|CoLA|SST|MRPC|STS|QQP|MNLI|QNLI|RTE|Avg.|
 |---|---|---|---|---|---|---|---|---|---|
 |ELECTRA-Small++|55.6|91.1|84.9|84.6|88.0|81.6|88.3|6.36|79.7|
 |ELECTRA-Small++ (my)|54.8|91.6|84.6|84.2|88.5|82|89|64.7|79.92
-Table2: Results on GLUE test set. My result finetunes the pretrained checkpoint loaded from huggingface.
+
+*Table 2:* Results on GLUE test set. My result finetunes the pretrained checkpoint loaded from huggingface.
 
 Official training loss curve |  My training loss curve
 :-------------------------:|:-------------------------:
 ![image](https://user-images.githubusercontent.com/17963619/95172776-65682d80-07ea-11eb-82b1-5fcff9e8d6a8.png)|![image](https://user-images.githubusercontent.com/17963619/95174020-115e4880-07ec-11eb-8d51-baf30a958dfe.png)
-Table3. Both are small models trained on OpenWebText. The official one is from [here](https://github.com/google-research/electra/issues/3). You should take the value of training loss with a grain of salt since it doesn't reflect the performance of downstream tasks.
+
+*Table 3:* Both are small models trained on OpenWebText. The official one is from [here](https://github.com/google-research/electra/issues/3). You should take the value of training loss with a grain of salt since it doesn't reflect the performance of downstream tasks.
 
 # Features of this implementation
 
@@ -41,13 +44,15 @@ Table3. Both are small models trained on OpenWebText. The official one is from [
 |Mean|Std|Max|Min|#models|
 |---|---|---|---|---|
 |81.38|0.57|82.23|80.42|14|
-Tabel 4. Statistics of dev results of small models. Every model is pretrained from scratch with different seeds and finetuned for 10 random runs for each GLUE task. Score of a model is the average of the best of 10 for each task. (The process is as same as the one described in the paper) As we can see, although ELECTRA is mocking adeversarial training, it has a good training stability.
+
+*Tabel 4:* Statistics of dev results of small models. Every model is pretrained from scratch with different seeds and finetuned for 10 random runs for each GLUE task. Score of a model is the average of the best of 10 for each task. (The process is as same as the one described in the paper) As we can see, although ELECTRA is mocking adeversarial training, it has a good training stability.
 
 ## How stable is ELECTRA finetuing on GLUE ?
 |Model|CoLA|SST|MRPC|STS|QQP|MNLI|QNLI|RTE|
 |---|---|---|---|---|---|---|---|---|
 |ELECTRA-Small-OWT (my)|1.30|0.49|0.7|0.29|0.1|0.15|0.33|1.93
-Table 5. Standard deviation for each task. This is the same model as Table 1, which finetunes 10 runs for each task.
+
+*Table 5:* Standard deviation for each task. This is the same model as Table 1, which finetunes 10 runs for each task.
 
 # Discussion
 [HuggingFace forum post](https://discuss.huggingface.co/t/electra-training-reimplementation-and-discussion/1004/7)  
@@ -137,7 +142,7 @@ project root
 }
 ```
 ## This implementation. 
-**I will join RC2020 so maybe this will become another paper then. Be sure to check here again when you cite this implementation.**
+**I will join RC2020 so maybe there will be another paper for this implementation then. Be sure to check here again when you cite this implementation.**
 ```
 @misc{electra_pytorch,
   author = {Richard Wang},
