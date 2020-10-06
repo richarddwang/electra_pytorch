@@ -23,10 +23,10 @@ from _utils.would_like_to_pr import *
 
 # %%
 c = MyConfig({
-    'device': 'cuda:0',
+    'device': 'cuda:1',
     
-    'base_run_name': 'vanilla', # run_name = {base_run_name}_{seed}
-    'seed': 7, # 11081 36 1188 76 1 4 4649 7 9 99 # None/False to randomly choose seed from [0,99999]
+    'base_run_name': 'pre_io_nwd', # run_name = {base_run_name}_{seed}
+    'seed': 36, # 11081 36 1188 76 1 4 4649 7 9 99 # None/False to randomly choose seed from [0,99999]
 
     'adam_bias_correction': False,
     'schedule': 'original_linear',
@@ -34,18 +34,27 @@ c = MyConfig({
     'electra_mask_style': True,
     'gen_smooth_label': False,
     'disc_smooth_label': False,
+    'adam_beta1':0.9,
+    'adam_beta2':0.999,
+    'weight_decay': 0,
 
     'size': 'small',
     'datas': ['openwebtext'],
     
-    'neptune_logging': False,
+    'logging': None,
     'num_workers': 3,
     'my_model': True, # only for my personal research purpose
 })
 
 # only for my personal research purpose
 hparam_update = {
-    
+    #'product_type': 'square-l2',
+    #'i_mul': 'KV',
+    #'k_downscale': False,
+    #'i_prob_norm': False,
+    #'v_downscale': True,
+    'intermediate_dropout_rate':0.1,
+    'pre_norm': True,
 }
 
 """ Vanilla ELECTRA settings
@@ -55,6 +64,9 @@ hparam_update = {
 'electra_mask_style': True,
 'gen_smooth_label': False,
 'disc_smooth_label': False,
+'adam_beta1':0.9,
+'adam_beta2':0.999,
+'weight_decay': 0.01,
 'size': 'small',
 'datas': ['openwebtext'],
 """
@@ -65,6 +77,7 @@ hparam_update = {
 assert c.sampling in ['fp32_gumbel', 'fp16_gumbel', 'multinomial']
 assert c.schedule in ['original_linear', 'separate_linear', 'one_cycle', 'adjusted_one_cycle']
 for data in c.datas: assert data in ['wikipedia', 'bookcorpus', 'openwebtext']
+assert c.logging in ['neptune', 'wandb', False, None]
 if not c.base_run_name: c.base_run_name = str(datetime.now(timezone(timedelta(hours=+8))))[6:-13].replace(' ','').replace(':','').replace('-','')
 if not c.seed: c.seed = random.randint(0, 999999)
 c.run_name = f'{c.base_run_name}_{c.seed}'
@@ -88,12 +101,15 @@ gen_config.intermediate_size = disc_config.intermediate_size//generator_size_div
 hf_tokenizer = ElectraTokenizerFast.from_pretrained(f"google/electra-{c.size}-generator")
 
 # neptune (logging)
-if c.neptune_logging:
+if c.logging == 'neptune':
   import neptune
   from fastai.callback.neptune import NeptuneCallback
   class CustomNeptuneCallback(NeptuneCallback):
     def after_epoch(self): pass
   neptune.init(project_qualified_name='richard-wang/electra-pretrain')
+elif c.logging == 'wandb':
+  import wandb
+  from fastai.callback.wandb import  WandbCallback
 
 # Path to data
 Path('./datasets', exist_ok=True)
@@ -135,7 +151,7 @@ if 'wikipedia' in c.datas:
 # OpenWebText
 if 'openwebtext' in c.datas:
   print('load/download OpenWebText Corpus')
-  owt = datasets.load_dataset('/home/yisiang/datasets/datasets/openwebtext/openwebtext.py', cache_dir='./datasets')['train']
+  owt = datasets.load_dataset('openwebtext', cache_dir='./datasets')['train']
   print('load/create data from OpenWebText Corpus for ELECTRA')
   e_owt = ELECTRAProcessor(owt, apply_cleaning=False).map(cache_file_name=f"electra_owt_{c.max_length}.arrow", num_proc=1)
   dsets.append(e_owt)
@@ -367,8 +383,8 @@ electra_model = ELECTRAModel(generator, discriminator, hf_tokenizer)
 electra_loss_func = ELECTRALoss(gen_label_smooth=c.gen_smooth_label, disc_label_smooth=c.disc_smooth_label)
 
 # Optimizer
-if c.adam_bias_correction: opt_func = partial(Adam, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=0.01)
-else: opt_func = partial(Adam_no_bias_correction, eps=1e-6, mom=0.9, sqr_mom=0.999, wd=0.01)
+if c.adam_bias_correction: opt_func = partial(Adam, eps=1e-6, mom=c.adam_beta1, sqr_mom=c.adam_beta2, wd=c.weight_decay)
+else: opt_func = partial(Adam_no_bias_correction, eps=1e-6, mom=c.adam_beta1, sqr_mom=c.adam_beta2, wd=c.weight_decay)
 
 # Learning rate shedule
 if c.schedule.endswith('linear'):
@@ -387,14 +403,17 @@ learn = Learner(dls, electra_model,
                 path='./checkpoints',
                 model_dir='pretrain',
                 cbs=[mlm_cb,
-                    RunSteps(c.steps, [0.0625, 0.125, 0.25, 0.5, 1.0], c.run_name+"_{percent}"),
+                    RunSteps(c.steps, [0.25, 0.5, 1.0], c.run_name+"_{percent}"), # 0.0625, 0.125, 
                      ],
                 )
 
-# neptune logging (optional)
-if c.neptune_logging:
+# logging
+if c.logging == 'neptune':
   neptune.create_experiment(name=c.run_name, params={**c, **hparam_update})
   learn.add_cb(CustomNeptuneCallback(False))
+elif c.logging == 'wandb':
+  wandb.init(name=c.run_name, project='electra_pretrain', config={**c, **hparam_update})
+  learn.add_cb(WandbCallback(log_preds=False, log_model=False))
 
 # Mixed precison and Gradient clip
 learn.to_native_fp16(init_scale=2.**11)
