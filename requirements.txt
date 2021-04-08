@@ -5,3 +5,4 @@ fastcore>=1.0.20
 fastai>=2.0.15
 wandb>=0.10.4
 hugdatafast>=1.0.0
+jupyter
