@@ -318,10 +318,12 @@ class ELECTRAModel(nn.Module):
   def sample(self, logits):
     "Reimplement gumbel softmax cuz there is a bug in torch.nn.functional.gumbel_softmax when fp16 (https://github.com/pytorch/pytorch/issues/41663). Gumbel softmax is equal to what official ELECTRA code do, standard gumbel dist. = -ln(-ln(standard uniform dist.))"
     if c.sampling == 'fp32_gumbel':
-      return (logits.float() + self.gumbel_dist.sample(logits.shape)).argmax(dim=-1)
-    elif c.sampling == 'fp16_gumbel': # 5.06 ms
-      return (logits + self.gumbel_dist.sample(logits.shape)).argmax(dim=-1)
-    elif c.sampling == 'multinomial': # 2.X ms
+      gumbel = self.gumbel_dist.sample(logits.shape).to(logits.device)
+      return (logits.float() + gumbel).argmax(dim=-1)
+    elif c.sampling == 'fp16_gumbel':  # 5.06 ms
+      gumbel = self.gumbel_dist.sample(logits.shape).to(logits.device)
+      return (logits + gumbel).argmax(dim=-1)
+    elif c.sampling == 'multinomial':  # 2.X ms
       return torch.multinomial(F.softmax(logits, dim=-1), 1).squeeze()
 
 class ELECTRALoss():
@@ -375,7 +377,7 @@ else: opt_func = partial(Adam_no_bias_correction, eps=1e-6, mom=0.9, sqr_mom=0.9
 # Learning rate shedule
 if c.schedule.endswith('linear'):
   lr_shed_func = linear_warmup_and_then_decay if c.schedule=='separate_linear' else linear_warmup_and_decay
-  lr_shedule = ParamScheduler({'lr': partial(linear_warmup_and_decay,
+  lr_shedule = ParamScheduler({'lr': partial(lr_shed_func,
                                              lr_max=c.lr,
                                              warmup_steps=10000,
                                              total_steps=c.steps,)})
