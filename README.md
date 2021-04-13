@@ -76,7 +76,7 @@ Official training loss curve |  My training loss curve
 
 - You will need a [Neptune](https://neptune.ai) account and create a neptune project on the website to record GLUE finetuning results. Don't forget to replace `richarddwang/electra-glue` with your neptune project's name
 
-- The python files `pretrian.py`, `finetune.py` are in fact converted from `Pretrain.ipynb` and `Finetune_GLUE.ipynb`. You can also use those notebooks to explore ELECTRA training and finetuning.
+- The python files `pretrain.py`, `finetune.py` are in fact converted from `Pretrain.ipynb` and `Finetune_GLUE.ipynb`. You can also use those notebooks to explore ELECTRA training and finetuning.
 
 # Advanced Details
 Below lists the details of the [original implementation](https://github.com/google-research/electra)/paper that are easy to be overlooked and I have taken care of. I found these details are indispensable to successfully replicate the results of the paper.
