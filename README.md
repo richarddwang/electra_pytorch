@@ -16,7 +16,7 @@ I pretrain ELECTRA-small from scratch and have successfully replicated the paper
 
 |Model|CoLA|SST|MRPC|STS|QQP|MNLI|QNLI|RTE|Avg.|
 |---|---|---|---|---|---|---|---|---|---|
-|ELECTRA-Small++|55.6|91.1|84.9|84.6|88.0|81.6|88.3|6.36|79.7|
+|ELECTRA-Small++|55.6|91.1|84.9|84.6|88.0|81.6|88.3|63.6|79.7|
 |ELECTRA-Small++ (my)|54.8|91.6|84.6|84.2|88.5|82|89|64.7|79.92
 
 *Table 2:* Results on GLUE test set. My result finetunes the pretrained checkpoint loaded from huggingface.
