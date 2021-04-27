@@ -3,7 +3,7 @@ Unofficial PyTorch implementation of
 > [ELECTRA: Pre-training Text Encoders as Discriminators Rather Than Generators](https://arxiv.org/abs/2003.10555)
 > by Kevin Clark. Minh-Thang Luong. Quoc V. Le. Christopher D. Manning
 
-※ For updates and more work in the future, [![Twitter](https://img.shields.io/twitter/url/https/twitter.com/cloudposse.svg?style=social&label=Follow%20%40Richard%20Wang)](https://twitter.com/_RichardWang_)
+※ For updates and more work in the future, follow [![Twitter](https://img.shields.io/twitter/url/https/twitter.com/cloudposse.svg?style=social&label=Richard%20Wang)](https://twitter.com/_RichardWang_)
 
 # Replicated Results
 I pretrain ELECTRA-small from scratch and have successfully replicated the paper's results on GLUE. 
