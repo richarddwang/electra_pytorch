@@ -121,7 +121,7 @@ class ELECTRADataProcessor(object):
       function=self,
       batched=True,
       remove_columns=self.hf_dset.column_names, # this is must b/c we will return different number of rows
-      disable_nullable=True,
+      disable_nullable=False,
       input_columns=[self.text_col],
       writer_batch_size=10**4,
       num_proc=num_proc,
