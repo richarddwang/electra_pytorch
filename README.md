@@ -144,7 +144,6 @@ project root
 }
 ```
 ## This implementation. 
-**I will join RC2020 so maybe there will be another paper for this implementation then. Be sure to check here again when you cite this implementation.**
 ```
 @misc{electra_pytorch,
   author = {Richard Wang},
