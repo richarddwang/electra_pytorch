@@ -149,10 +149,11 @@ print(c)
 
 
 # %%
+accuracy_metric = AvgMetric(lambda inp,targ: torch.eq(torch.tensor(inp.argmax(dim=-1)), torch.tensor(targ)).float().mean())
 METRICS = {
   **{ task:[MatthewsCorrCoef()] for task in ['cola']},
-  **{ task:[accuracy] for task in ['sst2', 'mnli', 'qnli', 'rte', 'wnli', 'snli','ax']},
-  **{ task:[F1Score(), accuracy] for task in ['mrpc', 'qqp']}, 
+  **{ task:[accuracy_metric] for task in ['sst2', 'mnli', 'qnli', 'rte', 'wnli', 'snli','ax']},
+  **{ task:[F1Score(), accuracy_metric] for task in ['mrpc', 'qqp']}, 
   **{ task:[PearsonCorrCoef(), SpearmanCorrCoef()] for task in ['stsb']}
 }
 NUM_CLASS = {
@@ -229,7 +230,7 @@ for task in ['cola', 'sst2', 'mrpc', 'stsb', 'mnli', 'qqp', 'qnli', 'rte', 'wnli
     glue_dsets[task]['train'] = datasets.concatenate_datasets([glue_dsets[task]['train'], swapped_train])
 
   # Load / Make dataloaders
-  hf_dsets = HF_Datasets(glue_dsets[task], hf_toker=hf_tokenizer, n_inp=3,
+  hf_dsets = HF_Datasets(glue_dsets[task], hf_toker=hf_tokenizer, n_inp=3, test_with_y=True,
                 cols={'inp_ids':TensorText, 'attn_mask':noop, 'token_type_ids':noop, 'label':TensorCategory})
   if c.double_unordered and task in ['mrpc', 'stsb']:
     dl_kwargs = {'train': {'cache_name': f"double_dl_{c.max_length}_train.json"}}
@@ -245,7 +246,7 @@ if c.wsc_trick:
   glue_dsets['wnli'] = wsc.my_map(partial(wsc_trick_process, hf_toker=hf_tokenizer),
                                   cache_file_names="tricked_{split}.arrow")
   cols={'prefix':TensorText,'suffix':TensorText,'cands':TensorText,'cand_lens':noop,'label':TensorCategory}
-  glue_dls['wnli'] = HF_Datasets(glue_dsets['wnli'], hf_toker=hf_tokenizer, n_inp=4, 
+  glue_dls['wnli'] = HF_Datasets(glue_dsets['wnli'], hf_toker=hf_tokenizer, n_inp=4, test_with_y=True,
                                  cols=cols).dataloaders(bs=32, cache_name="dl_tricked_{split}.json")
 
 # %% [markdown]
